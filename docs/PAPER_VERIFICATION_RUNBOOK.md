@@ -316,49 +316,40 @@ Expected: a JSON health snapshot with an overall `status`, explicit availability
 
 **Precise steps**
 
-- [ ] Confirm the breaker is clear with `python -m app.cli breaker status`.
-- [ ] Run this read-only probe exactly once. It has no call to `submit_order`, `ExecutionEngine.submit`, `cancel_order`, `close_position`, or `close_all_positions`.
+- [ ] Confirm the working tree and test suite are clean.
+- [ ] Confirm the breaker is clear.
+- [ ] Run the dedicated read-only probe exactly once and save its complete output for review:
 
 ```bash
-python - <<'PY'
-from datetime import datetime, timedelta, timezone
-from app.broker.alpaca_adapter import AlpacaPaperBroker
-from app.catalyst.sec_edgar import SecEdgarFilingProvider
-from app.marketdata.alpaca_provider import AlpacaMarketDataProvider
-from app.marketdata.session import MarketSessionService
-
-broker = AlpacaPaperBroker()
-account = broker.get_account()
-session = MarketSessionService(client=broker.trading_client).current_session()
-provider = AlpacaMarketDataProvider(symbols=("AAPL",))
-quote = broker.get_quote("AAPL")
-now = datetime.now(timezone.utc)
-bars = provider.get_bars("AAPL", "1min", now - timedelta(minutes=10), now)
-edgar = SecEdgarFilingProvider().research("AAPL", now - timedelta(days=2))
-
-print("account_timestamp=", account.timestamp)
-print("buying_power=", account.buying_power)
-print("session=", session.session)
-print("quote_timestamp=", quote.timestamp)
-print("bar_data_timestamp=", bars.attrs["data_timestamp"])
-print("edgar_result=", edgar.reason)
-print("NO ORDER WAS PLACED")
-PY
+git status --short
+python -m pytest -q
+python -m app.cli status
+python -m app.cli breaker status
+mkdir -p logs
+python -m app.cli paper-probe connectivity --symbol SPY | tee logs/paper-probe-stage-a.txt
 ```
+
+The connectivity implementation receives a read-only broker capability. It
+cannot call `submit_order`, `modify_order`, `cancel_order`,
+`cancel_all_orders`, `close_position`, or `close_all_positions`. Automated
+AST and mutation-recording tests fail if that boundary changes.
 
 **Observe**
 
-- [ ] Account, buying power, session string, and quote timestamp print without an exception.
+- [ ] The report shows PASS for account, buying power, positions, open orders,
+  market clock/session, SPY quote, recent bars, required freshness,
+  SPY/QQQ/IWM regime inputs, SEC EDGAR, read-only reconciliation, and breaker.
 - [ ] The EDGAR result is either verified filings or an explicit verified-negative result; an explicit “no verified catalyst found” is acceptable, but a timeout/configuration failure is not.
-- [ ] The final line says `NO ORDER WAS PLACED`.
+- [ ] The final line says `OVERALL: PASS`.
+- [ ] `logs/paper-probe-stage-a.txt` contains no credential values or account identifier.
 
 **Pass criteria**
 
-- [ ] All reads return without error.
-- [ ] Session is not `UNKNOWN`.
-- [ ] Quote has an API timestamp.
-- [ ] EDGAR request completes through the contact-bearing User-Agent.
-- [ ] No broker order ID was created because no order path was called.
+- [ ] Every required check is PASS; FAIL, BLOCKED, and OPTIONAL/UNAVAILABLE do
+  not satisfy a required check.
+- [ ] Reconciliation is clean and the persistent breaker is clear.
+- [ ] No broker mutation occurred and no broker order ID was created.
+- [ ] A reviewer has inspected the saved output before Stage B.
 
 **Abort criteria**
 
@@ -368,38 +359,63 @@ PY
 
 - [ ] No order should exist. Run `python -m app.cli breaker status`, then the reconciliation check from preflight item 11. If either indicates an order or position, immediately use section 6.
 
-### Stage B — Paper account read/write probe
+### Stage B — Single supervised PAPER order
 
 **Goal:** submit the smallest safe PAPER order the architecture supports, then establish broker-confirmed state through an independent read and verify broker-side protection.
 
-**Architecture constraint — do not bypass it:** there is currently **no supported CLI subcommand or flag that creates one bounded manual PAPER order**. The supported `python -m app.cli run --mode paper` command runs the full scan-to-pipeline cycle over its configured universe and has no `--symbol`, `--quantity`, `--one-order`, or dry-run flag. The pipeline can iterate multiple candidates. Therefore this runbook does **not** authorize constructing a private grant, hand-writing authorization evidence, or calling the broker adapter directly to force a “one share” order. That would bypass the normal strategy/risk/pipeline controls and would not be a valid verification of the architecture.
+**DO NOT RUN UNTIL STAGE A OUTPUT HAS BEEN REVIEWED.** Creating the command
+does not authorize its use. Stage B requires a new, explicit operator decision
+after the saved Stage A evidence has passed review.
 
 **Precise steps**
 
-- [ ] **BLOCKED until a reviewed, supported single-order PAPER probe exists.** Record this as a failed acceptance gate; do not substitute an invented command.
-- [ ] When such a capability is added and reviewed, use only a highly liquid symbol, minimal whole-share quantity, normal session rules, current quote/bar/account freshness, and broker-native protection.
-- [ ] The future probe must record its broker order ID, then call `get_order_status(broker_order_id)` independently. A submit response is an acknowledgement, not a fill.
-- [ ] If unfilled, cancel it using the supported protective cancellation path. If filled or partially filled, verify the broker accepted a protective exit before treating the stage as passed; if protection cannot be confirmed, flatten.
+- [ ] Obtain explicit approval to proceed after Stage A review.
+- [ ] Use a reviewed highly liquid symbol and one whole share:
+
+```bash
+python -m app.cli paper-probe order --symbol SPY --qty 1 \
+  --i-understand-this-submits-a-paper-order
+```
+
+- [ ] The acknowledgement is PAPER-only and cannot authorize LIVE.
+- [ ] The probe must refuse unless the exact `AlpacaPaperBroker` and
+  `AlpacaMarketDataProvider` types, PAPER environment, PAPER endpoint,
+  fresh quote/bars/account, allowed session, sufficient buying power,
+  liquidity/spread gates, clean reconciliation, clear breaker, and
+  `ExecutionAuthorizer` grant all agree.
 
 **Observe**
 
-- [ ] A future supported probe must show a unique broker order ID.
-- [ ] Its independent broker read must show status, `filled_qty`, and `filled_avg_price` where applicable.
-- [ ] A BRACKET/OCO protective structure must contain both take-profit and stop-loss; no extended-hours bracket is permitted.
+- [ ] One durable local PROPOSED order exists before submission.
+- [ ] Exactly one broker submission occurs and returns a unique broker order ID.
+- [ ] An independent broker read establishes the state; the submit receipt is
+  never treated as a fill.
+- [ ] An unfilled order is cancelled and cancellation is independently
+  confirmed. A filled order passes only with broker-confirmed bracket legs.
+- [ ] A partial fill, rejection, timeout, UNKNOWN state, or missing protection
+  is a Stage B failure and requires supervised reconciliation.
 
 **Pass criteria**
 
-- [ ] Not currently satisfiable with the existing supported CLI surface.
-- [ ] This stage becomes passable only after a reviewed single-order procedure can prove exactly one controlled PAPER order, independent broker-status confirmation, cancellation when unfilled, and accepted protection when filled.
+- [ ] Exactly one controlled PAPER order was submitted.
+- [ ] Broker-confirmed state, cancellation when unfilled, or accepted
+  broker-native protection when filled is present in the journal evidence.
+- [ ] Final reconciliation has no blocking discrepancy and no unexpected
+  unmanaged position exists.
 
 **Abort criteria**
 
-- [ ] Any temptation to use a fabricated CLI flag, a direct `submit_order` call with manually created evidence, a non-liquid symbol, an order outside allowed session rules, a submission timeout, or missing protection.
+- [ ] Missing acknowledgement, wrong type/environment/endpoint, stale or
+  malformed data, risk rejection, dirty reconciliation, tripped breaker,
+  submission timeout, UNKNOWN state, partial fill, failed cancellation, or
+  missing protective legs.
 
 **Rollback**
 
-- [ ] If no order was sent, record the capability gap and stop.
-- [ ] If an order or position exists for any reason, follow section 6 immediately. Do not retry a submission whose outcome is uncertain.
+- [ ] If no order was sent, preserve the refusal output and stop.
+- [ ] On uncertain submission, leave the automatically tripped breaker in
+  place, do not retry, and follow section 6.
+- [ ] If any order or position exists, reconcile before further action.
 
 ### Stage C — Pipeline supervised PAPER trade
 
@@ -407,7 +423,8 @@ PY
 
 **Precise steps**
 
-- [ ] Stage A must pass. Stage B must be resolved by a reviewed supported capability before any order-capable pipeline test.
+- [ ] Stage A and Stage B must pass. **Stage C is not authorized by this
+  Milestone 3A runbook update; obtain separate approval before proceeding.**
 - [ ] Before starting, reduce exposure using only reviewed local configuration values and confirm the effective configuration with `python -m app.cli status`. The configuration must still say PAPER.
 - [ ] Confirm the market session is explicitly allowed by the current configuration. Default allowed sessions are `REGULAR`; `PREMARKET`, `AFTER_HOURS`, `CLOSED`, `HOLIDAY`, `EARLY_CLOSE`, and `UNKNOWN` are not an entry authorization unless explicitly configured and compatible with order constraints.
 - [ ] Start the single supported cycle while the operator watches its entire output:
@@ -445,6 +462,10 @@ python -m app.cli run --mode paper
 ### Stage D — Reconciliation / restart
 
 **Goal:** prove that restart does not erase local/broker truth and that a blocking discrepancy halts new entries.
+
+**NOT AUTHORIZED YET.** Milestone 3A proves the behavior with genuine
+subprocess crash/restart tests only. Real external Stage D activity requires a
+separate operator authorization after Stages A–C are reviewed.
 
 **Precise steps**
 
@@ -484,6 +505,9 @@ python -m app.cli run --mode paper
 
 **Goal:** observe a short, deliberate PAPER-only operating window after Stages A–D pass.
 
+**NOT AUTHORIZED YET.** Do not begin a supervised multi-cycle session under
+Milestone 3A.
+
 **Precise steps**
 
 - [ ] Limit the session to one operator-attended cycle at a time using only `python -m app.cli run --mode paper`.
@@ -511,6 +535,19 @@ python -m app.cli run --mode paper
 
 > **Unattended PAPER automation is NOT authorized yet.** Stage E is limited to operator-attended, one-cycle invocations.
 
+### Stage F — Unattended PAPER
+
+**NOT AUTHORIZED.** No scheduler, background worker, recurring task, or
+unattended PAPER session may be started. Promotion to this stage requires new
+evidence, explicit operator authorization, reviewed monitoring/rollback
+procedures, and completion of the repository's promotion criteria.
+
+### LIVE
+
+**DISABLED.** Milestone 3A does not add or authorize a LIVE path.
+`run --mode live` refuses before broker construction and
+`AlpacaLiveBroker` independently refuses construction.
+
 ## 5. Acceptance gates
 
 Do not mark a box complete based on a submit acknowledgement alone. A submitted order is not a filled order until a fresh independent broker-status read confirms it.
@@ -523,7 +560,7 @@ Do not mark a box complete based on a submit acknowledgement alone. A submitted 
 | Account reads | - [ ] | - [ ] Query error: stop. |
 | Buying power reads | - [ ] | - [ ] Missing/invalid `buying_power`: stop; do not use removed PDT fields. |
 | Positions read | - [ ] | - [ ] Query error or unknown position: reconcile and halt. |
-| Order submission succeeds | - [ ] | - [ ] Currently blocked pending a reviewed one-order probe; no invented command. |
+| Order submission succeeds | - [ ] | - [ ] Use only the reviewed Stage B command after Stage A approval. |
 | Order-status reconciliation succeeds | - [ ] | - [ ] Uncertain/mismatched state: breaker trip and reconcile. |
 | Cancel succeeds | - [ ] | - [ ] Stop and reconcile broker orders. |
 | Protective exit accepted | - [ ] | - [ ] Flatten if protection cannot be verified. |

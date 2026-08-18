@@ -507,6 +507,116 @@ def cmd_dashboard(args):
                 reload=False)
 
 
+def _paper_probe_runtime(cfg, *, symbol: str, require_sec: bool):
+    from app.paper_runtime import build_paper_runtime
+
+    symbols = tuple(dict.fromkeys((symbol.upper(), "SPY", "QQQ", "IWM")))
+    return build_paper_runtime(
+        symbols=symbols,
+        breaker_path=_breaker_db_path(cfg),
+        breaker_config=cfg.get("circuit_breaker"),
+        require_sec=require_sec,
+    )
+
+
+def _paper_probe_local_state(journal):
+    # Re-use the production journal interpretation so the probe cannot present
+    # an empty local state while durable orders or positions actually exist.
+    from app.orchestration.pipeline import _local_positions
+
+    return journal.open_orders(), _local_positions(journal)
+
+
+def _paper_probe_freshness(cfg) -> dict[str, float]:
+    return {
+        "quote": float(cfg.get("data_freshness.quote_max_age_seconds")),
+        "bars": float(cfg.get("data_freshness.bar_max_age_seconds")),
+        "account": float(cfg.get("data_freshness.account_max_age_seconds")),
+    }
+
+
+def cmd_paper_probe(args):
+    """Dedicated verification path; never invokes scanners or strategies."""
+    from app.paper_runtime import PaperRuntimeError
+
+    cfg = load_config(args.config)
+    if args.probe_command == "order":
+        if not args.i_understand_this_submits_a_paper_order:
+            print(
+                "PAPER ORDER PROBE REFUSED: missing required acknowledgement "
+                "--i-understand-this-submits-a-paper-order",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if cfg.mode is not Mode.PAPER:
+            print(
+                f"PAPER ORDER PROBE REFUSED: configured mode is {cfg.mode.value}, "
+                "not PAPER",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    try:
+        runtime = _paper_probe_runtime(
+            cfg,
+            symbol=args.symbol,
+            require_sec=args.probe_command == "connectivity",
+        )
+    except PaperRuntimeError as exc:
+        print(f"PAPER PROBE REFUSED: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    journal = _journal_from_cfg(cfg)
+    local_open_orders, local_positions = _paper_probe_local_state(journal)
+    if args.probe_command == "connectivity":
+        from app.verification.connectivity import run_connectivity_probe
+
+        report = run_connectivity_probe(
+            runtime,
+            symbol=args.symbol,
+            local_open_orders=local_open_orders,
+            local_positions=local_positions,
+            freshness_max_ages=_paper_probe_freshness(cfg),
+        )
+    else:
+        from app.verification.order_probe import (
+            OrderProbeConfig,
+            OrderProbeRefused,
+            run_order_probe,
+        )
+
+        risk_cfg = cfg.get("risk")
+        try:
+            report = run_order_probe(
+                runtime,
+                journal=journal,
+                symbol=args.symbol,
+                qty=args.qty,
+                acknowledged=args.i_understand_this_submits_a_paper_order,
+                configured_mode=cfg.mode,
+                config_mode_source=cfg.mode_source,
+                config=OrderProbeConfig(
+                    max_spread_pct=risk_cfg["max_spread_pct"],
+                    min_liquidity_avg_dollar_vol=risk_cfg[
+                        "min_liquidity_avg_dollar_vol"
+                    ],
+                    risk_config=risk_cfg,
+                    allowed_sessions=tuple(
+                        cfg.get("sessions.allowed") or ("REGULAR",)
+                    ),
+                ),
+                local_open_orders=local_open_orders,
+                local_positions=local_positions,
+                freshness_max_ages=_paper_probe_freshness(cfg),
+            )
+        except OrderProbeRefused as exc:
+            print(f"PAPER ORDER PROBE REFUSED: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    print(report.render())
+    if not report.passed:
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(prog="aegis-trader")
@@ -549,6 +659,28 @@ def main():
     dash_p = sub.add_parser("dashboard")
     dash_p.add_argument("--port", type=int, default=8080)
     dash_p.set_defaults(func=cmd_dashboard)
+
+    probe_p = sub.add_parser(
+        "paper-probe",
+        help="Operator-controlled PAPER verification; separate from strategies.",
+    )
+    probe_sub = probe_p.add_subparsers(dest="probe_command", required=True)
+    connectivity_p = probe_sub.add_parser(
+        "connectivity", help="Read-only infrastructure verification."
+    )
+    connectivity_p.add_argument("--symbol", default="SPY")
+    connectivity_p.set_defaults(func=cmd_paper_probe)
+    order_p = probe_sub.add_parser(
+        "order", help="Submit at most one supervised PAPER bracket order."
+    )
+    order_p.add_argument("--symbol", required=True)
+    order_p.add_argument("--qty", type=int, default=1)
+    order_p.add_argument(
+        "--i-understand-this-submits-a-paper-order",
+        action="store_true",
+        help="Required PAPER-only acknowledgement. It grants no LIVE authority.",
+    )
+    order_p.set_defaults(func=cmd_paper_probe)
 
     args = parser.parse_args()
     args.func(args)
