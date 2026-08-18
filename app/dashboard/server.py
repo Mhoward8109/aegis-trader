@@ -14,11 +14,41 @@ from fastapi.responses import HTMLResponse
 
 from app.catalyst.engine import CatalystEngine, NullNewsProvider
 from app.config.loader import load_config
+from app.observability.health import build_health_snapshot
+from app.risk.persistent_circuit_breaker import (
+    PersistentCircuitBreaker,
+    default_breaker_path,
+)
 from app.scanner.base import ScanCriteria, Scanner
 from app.scanner.mock_provider import MockProvider
 from app.strategy.scoring import OpportunityScorer, ScoreInputs
 
 app = FastAPI(title="Aegis Trader Dashboard")
+
+
+def _build_health_snapshot(cfg, provider: MockProvider) -> dict:
+    """Build an honest health response even while this demo dashboard is offline."""
+    breaker = PersistentCircuitBreaker(
+        default_breaker_path(), cfg=cfg.get("circuit_breaker", {})
+    )
+    strategy_specs = [
+        {"name": name, "version": None}
+        for name in (cfg.get("strategies.enabled", []) or [])
+    ]
+    return build_health_snapshot(
+        mode=cfg.mode,
+        circuit_breaker=breaker,
+        market_data_provider=provider,
+        strategies=strategy_specs,
+        # This dashboard only runs an offline MockProvider and does not create a
+        # broker adapter, journal, freshness report, or reconciliation pass.
+        # Marking those absences is intentional: an operator must not mistake
+        # the dashboard demo for evidence that live entry gates are healthy.
+        broker_adapter_enabled=False,
+        broker_adapter_enabled_reason=(
+            "Dashboard is running with offline demo data; no broker adapter is instantiated."
+        ),
+    ).as_record()
 
 
 def _build_snapshot():
@@ -47,6 +77,9 @@ def _build_snapshot():
         s = scorer.score(inputs)
         opportunities.append({"ticker": r.ticker, "score": s["score"], "breakdown": s["breakdown"], **r.fields})
     opportunities.sort(key=lambda o: -o["score"])
+    health = _build_health_snapshot(cfg, provider)
+    breaker = health["circuit_breaker_state"]
+    breaker_value = breaker["value"] if breaker["availability"] == "AVAILABLE" else None
 
     return {
         "mode": cfg.mode.value,
@@ -58,7 +91,12 @@ def _build_snapshot():
         },
         "opportunities": opportunities[:10],
         "positions": [],  # wire to a live BrokerAdapter.get_positions() once configured
-        "circuit_breaker_tripped": False,
+        # Never replace an unread breaker with False: that manufactures false
+        # confidence, which is worse for an operator than no dashboard at all.
+        "circuit_breaker_tripped": (
+            breaker_value["tripped"] if breaker_value is not None else None
+        ),
+        "health": health,
         "data_source": "MockProvider (offline demo data — no credentials configured)",
     }
 
@@ -66,6 +104,13 @@ def _build_snapshot():
 @app.get("/api/snapshot")
 def api_snapshot():
     return _build_snapshot()
+
+
+@app.get("/health")
+def health():
+    """Machine-readable, fail-closed operator health snapshot."""
+    cfg = load_config()
+    return _build_health_snapshot(cfg, MockProvider())
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -121,6 +166,11 @@ def _render_html() -> str:
     <table id="positions"><thead><tr><th>Ticker</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th></tr></thead>
     <tbody><tr><td colspan="5" class="note">No open positions (or no broker connected).</td></tr></tbody></table>
   </div>
+  <div class="panel">
+    <h3>System Health</h3>
+    <table id="health"><tbody></tbody></table>
+    <pre class="note" id="healthjson"></pre>
+  </div>
 
 <script>
 async function refresh() {
@@ -144,8 +194,31 @@ async function refresh() {
     <tr><th>Max daily loss</th><td>${d.risk.max_daily_loss_pct}%</td></tr>
     <tr><th>Max trades/day</th><td>${d.risk.max_trades_per_day}</td></tr>
     <tr><th>Max concurrent positions</th><td>${d.risk.max_concurrent_positions}</td></tr>
-    <tr><th>Circuit breaker</th><td>${d.circuit_breaker_tripped ? 'TRIPPED' : 'clear'}</td></tr>
+    <tr><th>Circuit breaker</th><td>${d.circuit_breaker_tripped === true ? 'TRIPPED' : (d.circuit_breaker_tripped === false ? 'clear' : 'UNKNOWN')}</td></tr>
   `;
+
+  const h = d.health;
+  const display = field => {
+    if (field.availability !== 'AVAILABLE') return `${field.availability}: ${field.reason}`;
+    return typeof field.value === 'object' ? JSON.stringify(field.value) : String(field.value);
+  };
+  document.querySelector('#health tbody').innerHTML = `
+    <tr><th>Overall status</th><td>${h.status}</td></tr>
+    <tr><th>Blocking reasons</th><td>${h.blocking_reasons.length ? h.blocking_reasons.join(' | ') : 'None'}</td></tr>
+    <tr><th>Mode</th><td>${display(h.mode)}</td></tr>
+    <tr><th>Broker environment</th><td>${display(h.broker_environment)}</td></tr>
+    <tr><th>Broker adapter enabled</th><td>${display(h.broker_adapter_enabled)}</td></tr>
+    <tr><th>Market data health</th><td>${display(h.market_data_health)}</td></tr>
+    <tr><th>Last quote age</th><td>${display(h.last_quote_age_seconds)}</td></tr>
+    <tr><th>Reconciliation</th><td>${display(h.reconciliation_state)}</td></tr>
+    <tr><th>Circuit breaker</th><td>${display(h.circuit_breaker_state)}</td></tr>
+    <tr><th>Open positions</th><td>${display(h.open_positions)}</td></tr>
+    <tr><th>Open orders</th><td>${display(h.open_orders)}</td></tr>
+    <tr><th>Realized P&amp;L</th><td>${display(h.realized_pnl)}</td></tr>
+    <tr><th>Unrealized P&amp;L</th><td>${display(h.unrealized_pnl)}</td></tr>
+    <tr><th>Remaining daily risk budget</th><td>${display(h.remaining_daily_risk_budget)}</td></tr>
+  `;
+  document.getElementById('healthjson').textContent = JSON.stringify(h, null, 2);
 }
 refresh();
 setInterval(refresh, 15000);

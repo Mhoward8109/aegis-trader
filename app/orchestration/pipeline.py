@@ -445,8 +445,40 @@ def _process_candidate(*, result, ticker, mode, trade_mode, now, provider,
     # bars_prev_day is fetched SEPARATELY. Milestone 1 passed `bars_prev_day=bars`,
     # handing intraday bars to strategies expecting yesterday's session — so any
     # gap or prior-range comparison silently compared today against itself.
-    bars = provider.get_bars(ticker, "1min", now - dt.timedelta(hours=8), now)
-    bars_prev = _fetch_prev_day_bars(provider, ticker, now)
+    #
+    # The market-data fetch is wrapped because a provider timeout or HTTP error
+    # previously propagated out of here into the broad per-candidate exception
+    # handler. That handler kept the run alive, which looks like the right
+    # outcome, but it produced NO market-data refusal record: the candidate was
+    # logged as a generic error rather than as "refused because data was
+    # unusable". A feed that is timing out is exactly the condition the freshness
+    # design exists to catch, and it was the one condition that bypassed it.
+    try:
+        bars = provider.get_bars(ticker, "1min", now - dt.timedelta(hours=8), now)
+        bars_prev = _fetch_prev_day_bars(provider, ticker, now)
+    except Exception as exc:  # noqa: BLE001 - any provider failure is a data fault
+        detail = (f"market-data provider failed for {ticker}: "
+                  f"{type(exc).__name__}: {exc}")
+        log.error("%s — refusing this candidate; no order can be built without "
+                  "bars.", detail)
+        if mode.allows_order_submission:
+            # A provider that is erroring is a property of the feed, not of the
+            # symbol, so the breaker is tripped rather than merely skipping to the
+            # next ticker and failing identically on every one of them.
+            circuit_breaker.trip(
+                trigger=BreakerTrigger.STALE_MARKET_DATA,
+                detail=detail,
+                context={"ticker": ticker, "exception": type(exc).__name__},
+                session_date=session_date,
+            )
+        _journal_data_fault(journal, ticker, mode, now, detail,
+                            {"provider_error": type(exc).__name__,
+                             "message": str(exc)})
+        return PipelineOutcome(
+            ticker=ticker, stage_reached="market_data_unavailable",
+            gate="market_data", rejection_reason="provider_failure",
+            detail=detail), False
+
     computed = ind.compute_all(bars) if bars is not None and len(bars) > 0 else {}
 
     quote_obj = _get_quote(provider, broker, ticker)
@@ -503,12 +535,43 @@ def _process_candidate(*, result, ticker, mode, trade_mode, now, provider,
             ticker=ticker, stage_reached="data_incoherent", gate="data_coherence",
             rejection_reason="quote_bar_incoherent", detail=detail), False
 
-    if not freshness_report.all_required_fresh and mode.allows_order_submission:
-        # Trip the breaker, not just skip the ticker. Stale data is a property of
-        # the feed, not of the symbol, so continuing to the next ticker would
-        # keep trading on the same broken feed.
-        circuit_breaker.check_freshness_report(freshness_report,
-                                               session_date=session_date)
+    if not freshness_report.all_required_fresh:
+        if mode.allows_order_submission:
+            # Trip the breaker, not just skip the ticker. Stale data is a
+            # property of the feed, not of the symbol, so continuing to the next
+            # ticker would keep trading on the same broken feed. The trip is what
+            # actually stops the order: the authorization evidence built below
+            # re-reads the breaker, so a tripped breaker fails authorization.
+            circuit_breaker.check_freshness_report(freshness_report,
+                                                   session_date=session_date)
+        else:
+            # SHADOW. Previously this branch did not exist, so the freshness gate
+            # applied ONLY to order-submitting modes and a SHADOW run recorded
+            # hypothetical trades from stale data without comment. That is not a
+            # money-safety bug, but it is a data-integrity bug with real
+            # consequences: SHADOW output is the evidence base used to decide
+            # whether a strategy deserves promotion (PART 21), and a hypothetical
+            # fill priced off a stale quote is indistinguishable in the journal
+            # from one priced off a good quote. Poisoned evidence is worse than
+            # absent evidence, because it survives into a promotion decision.
+            #
+            # The persistent breaker is deliberately NOT tripped here: SHADOW
+            # places nothing at a broker, so there is no exposure to arrest, and
+            # letting an offline run latch a persistent breaker would block later
+            # real runs over a fault that risked nothing.
+            stale_detail = ("stale required data in a hypothetical-trade mode: "
+                            + str(freshness_report.detail))
+            _journal_data_fault(
+                journal, ticker, mode, now, stale_detail,
+                {"stale_required_sources":
+                     [str(getattr(s, "name", s))
+                      for s in freshness_report.stale_required_sources]})
+            return PipelineOutcome(
+                # No score is reported: this return happens BEFORE scoring, and
+                # emitting a score here would mean inventing one.
+                ticker=ticker, stage_reached="stale_data", gate="freshness",
+                rejection_reason="stale_required_data",
+                detail=stale_detail), False
 
     ctx = MarketContext(
         ticker=ticker, timestamp=now, bars_intraday=bars, bars_prev_day=bars_prev,

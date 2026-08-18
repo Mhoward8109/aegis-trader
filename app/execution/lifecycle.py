@@ -125,6 +125,29 @@ class DiscrepancyKind(str, Enum):
     MISSING_BROKER_ORDER = "missing_broker_order"
     ORDER_STATE_MISMATCH = "order_state_mismatch"
     BROKER_UNREACHABLE = "broker_unreachable"
+    #: A local order that is open but carries no broker order id. Either it was
+    #: never submitted, or it was submitted and the id was never durably written.
+    #: Those two cases differ by whether real exposure exists at the broker.
+    UNSUBMITTED_LOCAL_ORDER = "unsubmitted_local_order"
+    #: Recorded for visibility, deliberately NON-blocking: a locally-terminal
+    #: order absent from the broker's working list is the expected end state.
+    RESOLVED_BROKER_ORDER = "resolved_broker_order"
+
+
+#: Local states in which the broker is no longer expected to be working the
+#: order. Distinct from `TERMINAL_STATES`: FILLED is not terminal in this
+#: system's order lifecycle (an exit still has to happen) but the ENTRY order
+#: itself is complete at the broker, so its absence from the broker's working
+#: list is expected rather than a fault. Conflating the two made every completed
+#: fill look like a reconciliation failure.
+_BROKER_WORK_COMPLETE = {
+    OrderState.FILLED,
+    OrderState.CLOSED,
+    OrderState.CANCELLED,
+    OrderState.REJECTED,
+    OrderState.RISK_REJECTED,
+    OrderState.EXPIRED,
+}
 
 
 #: Discrepancies that mean we do not know our own exposure. Any of these blocks
@@ -137,6 +160,18 @@ BLOCKING_DISCREPANCIES = {
     DiscrepancyKind.UNEXPECTED_BROKER_ORDER,
     DiscrepancyKind.ORDER_STATE_MISMATCH,
     DiscrepancyKind.BROKER_UNREACHABLE,
+    # MISSING_BROKER_ORDER was originally excluded on the reasoning that a
+    # locally-open order the broker no longer lists has probably just filled or
+    # been cancelled, and can be refreshed individually. That reasoning is wrong
+    # in the case that matters most: after a crash between submission and the
+    # recording of the outcome, "probably filled" and "probably cancelled" imply
+    # OPPOSITE exposure -- one leaves an unmanaged position, the other leaves
+    # none. Until it is refreshed, the system does not know which, and PART 12
+    # requires unknown exposure to block new trading rather than proceed on the
+    # more convenient assumption. Refreshing the order clears the discrepancy and
+    # unblocks entries; guessing does not.
+    DiscrepancyKind.MISSING_BROKER_ORDER,
+    DiscrepancyKind.UNSUBMITTED_LOCAL_ORDER,
 }
 
 
@@ -411,14 +446,52 @@ class OrderLifecycleManager:
 
         for o in local_open_orders:
             bid = getattr(o, "broker_order_id", None)
-            if bid and str(bid) not in broker_ids:
+            if not bid:
+                # Originally skipped entirely, with the comment that an order
+                # without a broker id was simply never submitted and so needed no
+                # reconciliation. That holds only if the id is written before the
+                # submission call, and it is not: a crash in the window between
+                # `submit_order()` reaching the broker and the receipt being
+                # persisted leaves exactly this row, with real exposure attached
+                # to it. Treating "no id recorded" as "nothing was sent" is the
+                # optimistic reading of an ambiguous record, so it is refused.
                 discrepancies.append(Discrepancy(
-                    kind=DiscrepancyKind.MISSING_BROKER_ORDER,
+                    kind=DiscrepancyKind.UNSUBMITTED_LOCAL_ORDER,
+                    ticker=getattr(o, "ticker", None),
+                    detail=(f"local order {o.id} is open in state "
+                            f"{o.state.value} but records no broker order id. It "
+                            f"was either never submitted, or submitted with the "
+                            f"receipt lost before it could be written. Those two "
+                            f"cases differ by whether a live order exists, so "
+                            f"exposure is unknown until an operator resolves it."),
+                    local={"order_id": o.id, "state": o.state.value,
+                           "broker_order_id": None},
+                ))
+                continue
+            if str(bid) not in broker_ids:
+                # Whether this is alarming depends entirely on the LOCAL state.
+                # A locally-terminal order (FILLED, CLOSED, CANCELLED, ...) that
+                # the broker no longer lists as working is the normal, expected
+                # end of that order's life -- flagging it would halt trading after
+                # every successful trade, and a discrepancy that fires constantly
+                # trains operators to clear it without reading it. An order still
+                # locally in flight (SUBMITTED / ACKNOWLEDGED / PARTIALLY_FILLED /
+                # UNKNOWN) is the dangerous case: it may have filled or been
+                # cancelled, and those imply opposite exposure.
+                unresolved = o.state not in _BROKER_WORK_COMPLETE
+                discrepancies.append(Discrepancy(
+                    kind=(DiscrepancyKind.MISSING_BROKER_ORDER if unresolved
+                          else DiscrepancyKind.RESOLVED_BROKER_ORDER),
                     ticker=getattr(o, "ticker", None),
                     detail=(f"local order {o.id} (state {o.state.value}) references "
                             f"broker order {bid}, which the broker no longer lists as "
-                            f"open. It may have filled, been cancelled, or expired; "
-                            f"refresh it individually."),
+                            f"open. "
+                            + ("Local state is still in flight, so it may have "
+                               "filled, been cancelled, or expired; exposure is "
+                               "unknown until it is refreshed individually."
+                               if unresolved else
+                               "Local state is already terminal, so this is the "
+                               "expected end state and not a fault.")),
                     local={"order_id": o.id, "state": o.state.value,
                            "broker_order_id": str(bid)},
                 ))

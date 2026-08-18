@@ -276,3 +276,349 @@ clears it entirely. A crash-loop would reset the breaker on every restart.
 - The order state machine's transition table itself is correct — it forbids
   `SUBMITTED → FILLED` without a broker-confirmed event, as claimed. Its defect
   was non-invocation, not incorrectness.
+
+---
+
+## 9. Defects discovered *during* Milestone 2 implementation
+
+Sections 1–8 record the audit of the code as it stood at the *start* of
+Milestone 2. This section records defects discovered *while building* Milestone 2
+— including three introduced by the Milestone 2 work itself. They are separated
+from §8 deliberately: a defect found in your own fresh work is a different
+quality signal from a defect inherited from the previous milestone, and merging
+them would flatter the newer code.
+
+Three were exposed by the adversarial invariant suite (PART 18). Three were
+found by manual inspection and by driving the CLI end to end.
+
+### 9.1 Market-data `get_bars()` exceptions escaped the fail-closed freshness path
+
+**Defect.** `app/orchestration/pipeline.py` called
+`provider.get_bars(ticker, "1min", ...)` and `_fetch_prev_day_bars(...)` with no
+failure boundary. A provider timeout or HTTP error propagated out of
+`_process_candidate` into the broad per-candidate exception handler.
+
+**Why it mattered.** The broad handler keeps the run alive and logs a generic
+error, which superficially looks like correct resilience. But it produced **no
+market-data refusal record**: the candidate was journaled as an unspecified
+error rather than as "refused because required data was unusable". A feed that is
+timing out is precisely the condition the freshness architecture exists to catch,
+and it was the single condition that bypassed it. Worse, the run continued to the
+next ticker and failed identically on every one, so an outage looked like a
+scan that simply found nothing.
+
+**Detection.** `tests/test_invariant_market_data.py::test_provider_failure_or_timeout_fails_closed_and_is_journaled`,
+parameterised over `TimeoutError` and `RuntimeError`. Originally filed as a
+strict `xfail`.
+
+**Fix.** Wrapped both bar fetches in a `try/except Exception`. On failure the
+pipeline journals a data fault via `_journal_data_fault`, returns
+`stage_reached="market_data_unavailable"` with `rejection_reason="provider_failure"`,
+and — in an order-submitting mode — trips the breaker with
+`BreakerTrigger.STALE_MARKET_DATA`. The breaker is tripped rather than merely
+skipping the symbol because an erroring provider is a property of the *feed*, not
+of the *symbol*.
+
+**Regression test.** The two parameterised cases above, now passing (the `xfail`
+marker was removed). The test also asserts the stage is
+`market_data_unavailable` specifically, and *not* `not_authorized` — an operator
+reading the journal needs to see "the feed failed", not "authorization declined",
+because those demand completely different remedies.
+
+### 9.2 A crashed order with no durable broker ID was ignored by reconciliation
+
+**Defect.** `app/execution/lifecycle.py` built its local-order index as
+`{str(o.broker_order_id): o for o in local_open_orders if o.broker_order_id}`,
+silently dropping any locally-open order that carried no broker ID. No
+discrepancy was raised for a `RISK_APPROVED` order left behind by a crash.
+
+**Why it mattered.** The omission rested on the assumption that an order without
+a broker ID was simply never submitted. That holds only if the ID is written
+*before* the submission call — and it is not. A crash in the window between
+`submit_order()` reaching the broker and the receipt being persisted leaves
+exactly this row, **with real exposure attached to it**. Treating "no ID
+recorded" as "nothing was sent" is the optimistic reading of a genuinely
+ambiguous record, and PART 12 requires unknown exposure to block trading rather
+than resolve itself in the convenient direction.
+
+**Detection.** `tests/test_invariant_recovery.py::test_crash_before_submission_blocks_new_entries_after_restart`,
+filed as a strict `xfail`.
+
+**Fix.** Added `DiscrepancyKind.UNSUBMITTED_LOCAL_ORDER`, raised for any locally
+open order with no broker ID, and added it to `BLOCKING_DISCREPANCIES`. The
+detail string states the ambiguity explicitly rather than asserting a cause.
+
+**Regression test.** `test_crash_before_submission_blocks_new_entries_after_restart`,
+now passing.
+
+### 9.3 `MISSING_BROKER_ORDER` was recorded but did not block trading
+
+**Defect.** `DiscrepancyKind.MISSING_BROKER_ORDER` was created for a locally-open
+order absent from the broker's working list, but was omitted from
+`BLOCKING_DISCREPANCIES`, so it never stopped anything.
+
+**Why it mattered.** The original reasoning was that such an order has probably
+just filled or been cancelled and can be refreshed individually. That reasoning
+fails in the case that matters most: after a crash between submission and the
+recording of the outcome, "probably filled" and "probably cancelled" imply
+**opposite** exposure — one leaves an unmanaged position, the other leaves none.
+Until the order is refreshed the system does not know which, so a restart could
+resubmit and double the position.
+
+**Detection.** Two strict `xfail` tests:
+`test_crash_after_submission_blocks_new_entries_after_restart` and
+`test_restart_with_open_order_blocks_new_entries`.
+
+**Fix.** Added `MISSING_BROKER_ORDER` to `BLOCKING_DISCREPANCIES`. Refreshing the
+order clears the discrepancy and unblocks entries; guessing does not.
+
+**Regression test.** Both tests above, now passing.
+
+### 9.3.1 The over-correction, and how it was corrected
+
+Making `MISSING_BROKER_ORDER` blocking immediately broke two previously-passing
+tests, and the breakage was correct: the fix **halted trading after every normal
+fill**.
+
+The cause was a conflation of two different meanings of "finished". This
+system's `TERMINAL_STATES` (in `app/execution/order_state_machine.py`) describes
+the *full trade lifecycle*, in which `FILLED` is deliberately **not** terminal —
+a filled entry still has an exit ahead of it. Reconciliation needs a narrower
+question: *is the broker still expected to be working this order?* A `FILLED`
+entry order is complete at the broker even though the trade is not complete in
+this system, so its absence from the broker's working list is the expected end
+state, not a fault.
+
+Using `is_terminal()` therefore flagged every completed fill as a reconciliation
+failure. A discrepancy that fires constantly is not a safety feature: it trains
+operators to clear the alert without reading it, which destroys the value of the
+real signal on the day it matters.
+
+**Fix.** Introduced a separate set, `_BROKER_WORK_COMPLETE = {FILLED, CLOSED,
+CANCELLED, REJECTED, RISK_REJECTED, EXPIRED}`, used *only* by reconciliation.
+Absence from the broker's working list is now classified by local state:
+
+| Local state | Classification | Blocks new entries |
+|---|---|---|
+| In `_BROKER_WORK_COMPLETE` | `RESOLVED_BROKER_ORDER` | No — expected end state |
+| Still in flight (`SUBMITTED`, `ACKNOWLEDGED`, `PARTIALLY_FILLED`, `UNKNOWN`) | `MISSING_BROKER_ORDER` | Yes — exposure unknown |
+
+One test expectation was also updated rather than the production behaviour
+weakened. `test_crash_after_partial_fill_preserves_exposure_and_blocks_duplicate_entry`
+originally asserted that the run would continue and merely reject the symbol as a
+duplicate. A `PARTIALLY_FILLED` order absent from the broker's working list means
+the remainder is gone *and* the actually-filled quantity is unconfirmed, so
+continuing would imply the exposure is known when it is not. The test now asserts
+the halt. This is the one place in this milestone where a test assertion was
+changed to expect **stricter** behaviour than it originally demanded; the change
+is recorded here so it cannot be mistaken for a weakened test.
+
+### 9.4 SHADOW mode skipped freshness enforcement entirely
+
+**Defect.** The freshness gate was written as:
+
+```python
+if not freshness_report.all_required_fresh and mode.allows_order_submission:
+```
+
+`Mode.SHADOW.allows_order_submission` is `False`, so in SHADOW the entire gate
+was skipped and hypothetical trades were recorded from arbitrarily stale data
+with no comment.
+
+**Why it mattered.** This moves no money, and it was initially tempting to
+classify it as cosmetic. It is not. SHADOW output *is* the evidence base used to
+decide whether a strategy deserves promotion to PAPER (PART 21), and a
+hypothetical fill priced off a two-day-old quote is **indistinguishable in the
+journal** from one priced off a good quote. The failure mode is not a bad trade;
+it is a promotion decision made on corrupted evidence, months later, by someone
+who reasonably trusts the journal. Poisoned evidence is worse than absent
+evidence because it survives into the decision.
+
+**Detection.** Manual inspection while wiring `app/cli.py`, prompted by noticing
+that a SHADOW run reported `orders_submitted=3` even though
+`Mode.SHADOW.allows_order_submission` is `False` — which exposed that several
+gates keyed on that flag were inactive in SHADOW.
+
+**Fix.** The gate now fires in all modes, with mode-appropriate consequences. In
+an order-submitting mode it trips the breaker. In SHADOW it journals a data fault
+and returns `stage_reached="stale_data"`, `gate="freshness"`,
+`rejection_reason="stale_required_data"`. The persistent breaker is deliberately
+**not** tripped in SHADOW: SHADOW places nothing at a broker, so there is no
+exposure to arrest, and letting an offline run latch a persistent breaker would
+block later real runs over a fault that risked nothing.
+
+**Regression test.** `tests/test_invariant_shadow_data_integrity.py`, three tests:
+the stale-data refusal itself, the journaling of the refusal as a data fault
+attributed to `strategy="n/a"`, and a **control** case proving fresh data still
+reaches submission — without the control, the first test could pass for an
+unrelated reason.
+
+### 9.5 The first fix for 9.4 contained a `NameError` the whole suite missed
+
+**Defect.** The first version of the SHADOW freshness branch returned
+`PipelineOutcome(..., score=scored["score"], ...)`. The freshness gate runs at
+roughly line 506; `scored` is not assigned until roughly line 562. The branch
+would have raised `NameError` on its first execution.
+
+**Why it mattered.** Not for the bug itself — it was found and fixed within
+minutes — but for what it proves about the test suite. **The full 166-test suite
+passed with this defect present**, because no test drove stale data through
+SHADOW. A crash-on-first-execution defect in a freshly written safety branch was
+invisible to 166 green tests. This is the clearest single piece of evidence in
+this milestone for PART 19's instruction not to treat a test count as a quality
+metric.
+
+**Detection.** Writing the regression test for 9.4 — that is, the defect was
+found only because a test was written specifically to execute the new branch.
+
+**Fix.** Removed the `score=` argument. The branch now reports no score at all,
+with an inline comment recording that this return happens before scoring and
+emitting a score here would mean inventing one.
+
+**Regression test.** `test_shadow_refuses_stale_data_instead_of_journaling_a_hypothetical_trade`
+asserts `outcome.score is None`, so a future re-introduction of a fabricated
+score fails.
+
+### 9.6 `record_data_fault` destroyed the diagnostic it was written to preserve
+
+**Defect.** `TradeJournal.record_data_fault` assigned
+`c.setup_json = {"data_fault": context}` and committed. When `context` held a
+non-JSON-serializable value the flush raised `TypeError: Object of type
+SourceFreshness is not JSON serializable`, the transaction rolled back, and the
+subsequent `commit()` raised `PendingRollbackError`.
+
+**Why it mattered.** The net effect was **no row at all**. The mechanism whose
+entire purpose is to preserve a record of a data fault was destroyed by the
+detail it was trying to carry. This is the same failure shape as the
+`major_risks` list-bind defect in §5 of this audit: a diagnostic write aborted by
+its own payload. Two independent instances of one pattern in one codebase means
+the pattern, not the instance, is the defect.
+
+**Detection.** `tests/test_invariant_shadow_data_integrity.py::test_shadow_stale_data_is_journaled_as_a_data_fault_not_silently_dropped`
+failed with the SQLAlchemy `PendingRollbackError` traceback above. The caller was
+passing `freshness_report.stale_required_sources`, which contains
+`SourceFreshness` dataclasses rather than strings.
+
+**Fix.** Two changes, deliberately at two levels:
+
+1. **Caller** — the pipeline now passes
+   `[str(getattr(s, "name", s)) for s in ...stale_required_sources]`.
+2. **Journal** — a new `_json_safe(value)` helper recursively coerces any payload
+   into something `json.dumps` can accept: scalars pass through, dicts and
+   sequences recurse, objects exposing `as_record()` use it, objects with a
+   populated `__dict__` are converted, and anything else becomes its `repr`.
+
+The helper is deliberately **lossy rather than strict**. It is used on diagnostic
+payloads written during a fault, and raising there would destroy the record being
+written. A `repr` is inspectable by a human reading the journal even when it is
+not machine-parseable; a missing row is inspectable by nobody. Fixing only the
+caller would have left the next caller free to reintroduce the same defect, which
+is why both levels changed.
+
+**Regression test.** `test_shadow_stale_data_is_journaled_as_a_data_fault_not_silently_dropped`,
+which asserts the fault row exists, is `decision="REJECTED"`, and carries
+`strategy="n/a"`.
+
+---
+
+## 10. Engineering lessons
+
+These are recorded as durable conclusions, not as narrative. Each is stated
+because a defect in §9 demonstrated it concretely in this codebase.
+
+### 10.1 Diagnostic paths must be more robust than ordinary paths
+
+An error-reporting mechanism that can fail on the data it is recording is itself
+a reliability defect — and a particularly bad one, because it removes the
+evidence needed to diagnose the original fault. Ordinary code may fail loudly.
+Diagnostic code must degrade rather than raise.
+
+Consequences adopted: payload coercion at the persistence boundary is lossy by
+design (§9.6); a data fault is never attributed to a strategy, so a feed problem
+cannot poison a strategy's measured hit rate; and a fault row is always written
+even when its detail cannot be fully represented.
+
+Two independent instances of this pattern were found in this codebase (§5
+`major_risks`, §9.6 `record_data_fault`), which is why the fix was applied to the
+journal's write boundary rather than only to the calling site.
+
+### 10.2 Test coverage must include cross-mode behaviour, and test count is not a quality signal
+
+166 tests passed while the SHADOW stale-data branch contained a `NameError` that
+would raise on first execution (§9.5). The same suite passed while both shipped
+strategies were structurally incapable of producing a setup (§8.2), and while
+`_last_bar_timestamp` crashed every candidate in the freshness gate.
+
+The common cause is that behaviour was gated on `mode.allows_order_submission`
+while tests exercised predominantly one mode. A safety property that is
+implemented per-mode must be *tested* per-mode.
+
+Consequences adopted: tests are reported by safety invariant rather than by count
+(PART 19); every new gate gets a control case proving the negative test could
+have failed; and a branch that has never executed in any test is treated as
+unwritten regardless of how many tests pass around it.
+
+### 10.3 Reconciliation semantics require separate concepts, not one shared "terminal"
+
+Four distinct meanings were collapsed into a single `TERMINAL_STATES` set:
+
+| Concept | Question it answers | Where it belongs |
+|---|---|---|
+| Broker order work complete | Should the broker still be working this order? | `_BROKER_WORK_COMPLETE`, reconciliation only |
+| Entry filled | Did the entry execute? | `OrderState.FILLED` |
+| Position still open | Do we hold exposure right now? | Broker positions, not order state |
+| Full trade lifecycle terminal | Is this trade finished for accounting? | `TERMINAL_STATES` |
+
+`FILLED` answers *yes* to the first, *yes* to the second, *yes* to the third, and
+*no* to the fourth. Using one concept for all four produced a fix that halted
+trading after every successful fill (§9.3.1). Where two predicates disagree on
+even one state, they are two predicates.
+
+### 10.4 Promotion evidence must be trustworthy even when no money is at stake
+
+SHADOW data is the input to the decision about whether a strategy deserves PAPER
+or LIVE promotion. Stale, malformed, or misattributed SHADOW data is therefore a
+safety issue with a long fuse: nothing goes wrong at the time, and the
+consequence appears later as a confidently-made promotion decision resting on
+corrupted evidence.
+
+Consequences adopted: freshness is enforced in SHADOW (§9.4); data faults are
+recorded rather than skipped, because a silent skip is indistinguishable from
+"no candidate found" when reviewing a run months later; faults are attributed to
+`strategy="n/a"`; and the regime attached to a hypothetical trade is recorded as
+`UNKNOWN` rather than as a fabricated flat/neutral reading, since a wrong label
+is worse than an absent one precisely because it looks usable.
+
+---
+
+## 11. Correction to §8.3 of this document
+
+§8.3 lists as *verified correct*:
+
+> The order state machine's transition table itself is correct — it forbids
+> `SUBMITTED → FILLED` without a broker-confirmed event, as claimed. Its defect
+> was non-invocation, not incorrectness.
+
+**That assessment was wrong, and this document is the place to say so.**
+
+`ACKNOWLEDGED` is a state the *broker* passes through, not one the system can
+require the broker to report. Alpaca may transition an order to `filled` without
+this system ever observing an intermediate acknowledgement, particularly on a
+fast fill. Forbidding `SUBMITTED → FILLED` therefore forced every fast fill into
+`UNKNOWN` — and `UNKNOWN` suppresses protective-exit attachment. The stricter
+table produced **fewer protected positions than a more permissive one**, which is
+the opposite of what its strictness appeared to buy.
+
+`OrderState.SUBMITTED` now permits `{ACKNOWLEDGED, PARTIALLY_FILLED, FILLED,
+REJECTED, EXPIRED, UNKNOWN, CANCELLED}`. The property that actually matters is
+preserved and tested separately: the **risk gate cannot be skipped**, so
+`PROPOSED → SUBMITTED`, `PROPOSED → FILLED`, `PROPOSED → PARTIALLY_FILLED` and
+`PROPOSED → ACKNOWLEDGED` all still raise
+(`test_risk_gate_cannot_be_skipped_on_the_way_to_a_broker`), and
+`RISK_REJECTED` remains terminal
+(`test_risk_rejected_is_terminal_so_a_rejection_cannot_be_walked_back`).
+
+The general lesson: **strictness is not the same as safety.** A constraint that
+cannot be satisfied by the real external system does not prevent the bad
+outcome; it routes execution into the error path, and the error path is usually
+less protected than the success path.

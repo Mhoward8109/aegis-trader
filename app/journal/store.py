@@ -29,6 +29,30 @@ from app.common.db import (
 )
 
 
+def _json_safe(value):
+    """Recursively coerce a value into something json.dumps can handle.
+
+    Deliberately lossy rather than strict: this is used on diagnostic payloads
+    written during a fault, and raising here would destroy the very record being
+    written. Objects of unknown type become their repr, which is inspectable by a
+    human reading the journal even when it is not machine-parseable.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "as_record"):
+        try:
+            return _json_safe(value.as_record())
+        except Exception:  # noqa: BLE001 - never let diagnostics raise
+            pass
+    if hasattr(value, "__dict__") and value.__dict__:
+        return {str(k): _json_safe(v) for k, v in vars(value).items()}
+    return repr(value)
+
+
 def _as_text(value) -> str | None:
     """Coerce a list/tuple/dict to JSON for a TEXT column; pass strings through.
 
@@ -96,7 +120,16 @@ class TradeJournal:
             confidence=None, sources_json=None, decision="REJECTED",
             rejection_reason=detail, mode=mode,
         )
-        c.setup_json = {"data_fault": context}
+        # Coerce the context to something JSON-serializable BEFORE binding it.
+        # Freshness reports and broker payloads carry dataclasses and enums, and
+        # an un-serializable value here does not merely lose a detail field: the
+        # flush raises, the transaction rolls back, and the data fault leaves NO
+        # ROW AT ALL. That is the same failure shape as the `major_risks` list
+        # bind bug (docs/AUDIT_MILESTONE2.md) -- a diagnostic record destroyed by
+        # the diagnostic detail it was trying to carry. A degraded-but-present
+        # record beats a lost one, so unknown types are stringified rather than
+        # allowed to abort the write.
+        c.setup_json = {"data_fault": _json_safe(context)}
         self.session.add(c)
         self.session.commit()
         return c

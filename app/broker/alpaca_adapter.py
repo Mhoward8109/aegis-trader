@@ -147,6 +147,18 @@ class _AlpacaAdapterBase(BrokerAdapter):
         self._data_client = StockHistoricalDataClient(api_key, api_secret)
         self.base_url_in_use = self._EXPECTED_BASE_URL
 
+    @property
+    def trading_client(self):
+        """Read-only access to the underlying TradingClient.
+
+        Exposed so collaborators that legitimately need the broker's clock and
+        calendar (MarketSessionService, PART 10) do not have to reach into
+        `_client`. Deliberately read-only with no setter: a caller cannot swap in
+        a client pointed at a different endpoint after construction, which is the
+        whole point of hard-coding `paper=True` in the subclass.
+        """
+        return self._client
+
     # -- credentials -----------------------------------------------------
     @classmethod
     def _resolve_credentials(cls) -> tuple[str, str]:

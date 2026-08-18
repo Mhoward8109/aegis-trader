@@ -3,14 +3,14 @@
 ## 1. Requirements
 
 - Python 3.11+ (developed/tested on 3.14)
-- No credentials required for RESEARCH or SHADOW mode — this is the whole
-  point of the first milestone.
+- No credentials are required for RESEARCH or SHADOW mode. Those paths use
+  synthetic `MockProvider` data and the in-process `ShadowBroker`.
 
 ## 2. Install
 
 ```bash
 cd aegis-trader
-python -m venv .venv && source .venv/bin/activate   # optional but recommended
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -18,125 +18,79 @@ pip install -r requirements.txt
 
 ```bash
 python -m pytest tests/ -q
-# expect: NN passed
-
 python -m app.cli status
 python -m app.cli demo-scan
 ```
 
-`demo-scan` runs the scanner + catalyst engine + scoring against
-`MockProvider` (deterministic synthetic data, seeded) — if this prints a
-ticker/score table, the core pipeline works with zero external
-dependencies.
+`demo-scan` runs against `MockProvider`'s deterministic synthetic data. The
+test suite and this command exercise mocks and fixtures; they do **not** verify
+Alpaca connectivity, Alpaca market data, a broker clock, or a paper fill.
+
+**PAPER verification against a real Alpaca account has not yet occurred.
+Nothing in this system has been run against Alpaca.** Built and tested do not
+mean verified.
 
 ## 4. Configuration
 
-- `config/default.yaml` — checked into version control, holds every
-  trading-relevant parameter (spec §32: nothing trading-relevant lives in
-  source code). **Never put `mode: LIVE` or credentials here.**
-- `config/local.yaml` (create this yourself, it does not exist by default)
-  — git-ignored, overrides `default.yaml` key-by-key. This is where you'd
-  eventually set `mode: PAPER` or (much later, deliberately) `mode: LIVE`.
-- `config/events.yaml` — manually-maintained economic/earnings event
-  calendar used by the event-risk blackout gate. Empty by default; must be
-  refreshed by the operator (see comments in the file).
+- `config/default.yaml` is version-controlled and must never contain
+  credentials or `mode: LIVE`.
+- `config/local.yaml` is git-ignored and layers local settings over defaults.
+  A requested `run --mode` must match the resolved configured mode.
+- `config/events.yaml` is the manually maintained economic/earnings event
+  calendar used by the event-risk blackout gate.
 
-## 5. Credentials — What You Will Eventually Need, and Why
+## 5. PAPER Credentials and Dependencies
 
-Nothing below is required for the current milestone (RESEARCH/SHADOW mode
-work with zero credentials, using `MockProvider`). This is what unlocks
-each *later* phase:
+### 5a. Alpaca paper-trading credentials — needed for PAPER mode
 
-### 5a. Alpaca paper-trading API key — needed for Phase 9 (PAPER mode)
+`AlpacaPaperBroker` is the only real-order adapter that the CLI constructs in
+this milestone. It declares `BrokerEnvironment.PAPER` and uses the literal
+`paper=True` against `https://paper-api.alpaca.markets`. It has no constructor
+switch or URL override that can redirect it to LIVE.
 
-- **What**: An Alpaca API key ID + secret, scoped to the **paper**
-  environment.
-- **Why**: Lets `AlpacaBroker` submit orders to Alpaca's simulated paper
-  account (`https://paper-api.alpaca.markets`) instead of `ShadowBroker`'s
-  in-process simulation — the first time orders leave the process at all,
-  still with zero real money at risk.
-- **Where**: Sign up free at [alpaca.markets](https://alpaca.markets) —
-  email only, no funded/live account required. Generate keys under
-  Dashboard → "API Keys", making sure the **Paper Trading** toggle is
-  selected (not Live).
-- **Permissions**: Trading-only scope if Alpaca's key-generation UI offers
-  granular scopes at key-creation time; there is no reason this system
-  ever needs withdrawal/transfer permission, and it should never be
-  granted.
-- **How it's read**: environment variables `ALPACA_API_KEY_ID` and
-  `ALPACA_API_SECRET_KEY` (never written to any config file, never
-  committed).
-- **Safer alternative**: none needed — the paper endpoint already *is* the
-  safe, no-real-money alternative to a live account.
+The documented paper credential variables are:
 
-### 5b. Alpaca live API key — needed only for Phase 14, and only by hand
+- `ALPACA_PAPER_API_KEY_ID`
+- `ALPACA_PAPER_API_SECRET_KEY`
 
-- **What/where**: same Alpaca dashboard, but generated against a funded,
-  live brokerage account, with the **Live Trading** toggle selected.
-- **Why**: Required only if/when you and this assistant jointly decide, after
-  reviewing `config/default.yaml`'s `promotion_criteria.paper_to_live`
-  evidence bar, to actually enable Mode 3 LIVE. See `docs/SAFETY.md` §2 and
-  §9 — this is a deliberate, two-factor, manual promotion, never automatic.
-- **Env vars**: `ALPACA_LIVE_API_KEY_ID` / `ALPACA_LIVE_API_SECRET_KEY` —
-  deliberately named differently from the paper vars so a copy-paste
-  mistake can't silently point a paper run at a live key.
-- **Safer alternative**: keep using PAPER indefinitely; nothing forces a
-  timeline for this step.
+Keep them outside configuration files and use a trading-only key without
+withdrawal/transfer permission. Do not put credential values in shell history,
+documentation, source, or configuration.
 
-### 5c. SEC EDGAR contact email — optional, free, needed for catalyst filings lookups
+A PAPER run also constructs Alpaca market data, a broker-backed market session
+service, a regime engine, a persistent breaker, and catalyst research. If a
+required PAPER dependency cannot be constructed — credentials, broker, market
+data, broker clock, regime engine, or catalyst provider — the CLI exits. It
+does **not** fall back to `MockProvider` or `ShadowBroker`: a synthetic run
+reported as PAPER would falsely present simulated results as real broker/market
+results.
 
-- **What**: Just an email address, used in the `User-Agent` header SEC's
-  API requires ([SEC EDGAR access policy](https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data)).
-- **Why**: `SecEdgarProvider` (`app/catalyst/engine.py`) needs a compliant
-  User-Agent to query EDGAR's REST/full-text search APIs for 8-K/10-Q
-  filings as catalyst candidates.
-- **Where**: Not "obtained" — you already have an email address. No signup.
-- **Permissions**: none; EDGAR's API is public and free.
-- **How it's read**: environment variable `SEC_EDGAR_CONTACT_EMAIL`.
-- **Safer alternative**: none needed — this has no real-money or account
-  risk implication of any kind.
+SEC EDGAR filing research uses `SEC_EDGAR_CONTACT_EMAIL`. The explicit
+`--no-catalyst-research` PAPER option deliberately disables catalyst research
+and prints a degraded banner; it is not an automatic dependency fallback.
 
-### 5d. Benzinga News API key — optional, needed only if EDGAR filings aren't enough catalyst coverage
+### 5b. LIVE credentials and execution
 
-- **What**: A Benzinga API key.
-- **Why**: `NewsProvider` is pluggable; a `BenzingaNewsProvider` (not yet
-  built) would give real-time news catalysts beyond SEC filings.
-- **Where**: [benzinga.com/apis](https://www.benzinga.com/apis/) — starts
-  on a free AWS Marketplace tier.
-- **Permissions**: read-only news API key; no account-linkage risk.
-- **Safer alternative**: keep using `SecEdgarProvider`/`NullNewsProvider`
-  only — the system already runs correctly (just with fewer catalysts
-  detected) without this key.
+Do not prepare or rely on a LIVE run from this milestone. `run --mode live`
+refuses before constructing a broker, and `AlpacaLiveBroker` independently
+refuses construction. No configuration, strategy setting, or boolean flag
+enables live execution.
 
 ## 6. Environment Variable Summary
 
-```bash
-# Optional today, needed for Phase 9+:
-export ALPACA_API_KEY_ID="..."
-export ALPACA_API_SECRET_KEY="..."
+Set environment variables using your operating system's secure local mechanism;
+never commit values or place them in configuration files. The documentation
+refers to these names only:
 
-# Optional, only for a deliberate, reviewed promotion to LIVE (Phase 14):
-export ALPACA_LIVE_API_KEY_ID="..."
-export ALPACA_LIVE_API_SECRET_KEY="..."
-
-# Optional, improves catalyst engine, free:
-export SEC_EDGAR_CONTACT_EMAIL="you@example.com"
-
-# Optional, improves catalyst engine, paid beyond free tier:
-export BENZINGA_API_KEY="..."
-```
-
-Put these in your shell profile or a local `.env` file loaded by
-`python-dotenv` (already a dependency) — never in a committed config file.
+- `ALPACA_PAPER_API_KEY_ID`
+- `ALPACA_PAPER_API_SECRET_KEY`
+- `SEC_EDGAR_CONTACT_EMAIL`
 
 ## 7. Running the Dashboard
 
 ```bash
 python -m app.cli dashboard --port 8080
-# then open http://127.0.0.1:8080
 ```
 
-Shows the current mode banner (color-coded; LIVE pulses red), top-10
-scored opportunities with full score breakdowns, risk-engine limits, and
-current positions. Defaults to `MockProvider` until a real market-data
-adapter is wired in.
+Then open `http://127.0.0.1:8080`. The dashboard is local by default and has no
+authentication layer, so do not expose it beyond localhost.

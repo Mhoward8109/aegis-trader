@@ -3,7 +3,7 @@
 ## Who this is for
 
 You, as the single operator of this system. Nothing here assumes a team —
-commands are single-user, config files are local files, there's no
+commands are single-user, config files are local files, and there is no
 multi-tenant concept.
 
 ## Daily Commands
@@ -11,17 +11,23 @@ multi-tenant concept.
 ```bash
 export PATH="$PATH:$(python -m site --user-base)/bin"   # if pytest/CLI scripts aren't on PATH
 
-python -m app.cli status          # shows mode, risk limits, broker, strategies
-python -m app.cli demo-scan       # one-shot scan+score against MockProvider, no journaling
-python -m app.cli run --mode shadow   # full pipeline cycle: scan -> catalyst -> strategy ->
-                                        # score -> risk check -> journal (SHADOW: no broker call)
-python -m app.cli dashboard --port 8080   # visual snapshot at http://127.0.0.1:8080
+python -m app.cli status
+python -m app.cli demo-scan
+python -m app.cli run --mode shadow
+python -m app.cli run --mode paper
+python -m app.cli breaker status
+python -m app.cli dashboard --port 8080
 ```
 
-`run --mode X` requires `X` to match `mode:` in your active config
-(`default.yaml`, overridden by `local.yaml` if present) — this is
-intentional (see `docs/SAFETY.md` §3): the CLI will never silently run in
-a different mode than what's configured.
+`run --mode X` requires `X` to match `mode:` in the active configuration. A
+PAPER run constructs its real-paper dependencies or exits; it never switches to
+`MockProvider` or `ShadowBroker`. `run --mode live` is not an operator path:
+it refuses before broker construction, and `AlpacaLiveBroker` independently
+refuses construction.
+
+**PAPER verification has not occurred.** Nothing in this repository has been
+run against an Alpaca account. A PAPER command and its adapter are built, but
+that is not evidence of a verified broker connection or paper fill.
 
 ## Reading `run` Output
 
@@ -30,19 +36,20 @@ Scanned 1 candidates → 1 outcomes journaled → 0 orders submitted.
   COIN   stage=strategy_no_setup score=n/a
 ```
 
-`stage_reached` tells you exactly where each candidate stopped:
+`stage_reached` tells you where each candidate stopped:
 - `strategy_no_setup` — none of the enabled strategies found a valid setup
   (most common outcome; not an error)
 - `scored` — got a score but is below `min_score_to_consider`
-- `risk_rejected` — `RiskEngine` vetoed it; `rule_triggered` in the journal
-  DB explains which rule
-- `risk_approved` / `submitted` — cleared risk and (in SHADOW) was recorded
-  as a hypothetical fill, or (in PAPER/LIVE, not yet wired) sent to the
-  broker
+- `risk_rejected` — `RiskEngine` vetoed it; the journal explains which rule
+- `stale_data`, `market_data_unavailable`, or `data_incoherent` — required
+  market data was unusable; no order is placed
+- `not_authorized` — `ExecutionAuthorizer` refused the evidence bundle; no
+  execution grant exists for the candidate
+- `submitted` — a SHADOW hypothetical trade was recorded, or a PAPER order was
+  submitted and then queried again at the broker. Submission is not a fill.
 
-Every outcome — including `strategy_no_setup` — is written to the
-`candidates` table in the journal DB (default: `data/journal.db`), so
-nothing is lost even when nothing "interesting" happened.
+Every candidate outcome and data-integrity refusal is journaled. Do not read a
+missing order as a successful trade.
 
 ## Inspecting the Journal Database Directly
 
@@ -50,53 +57,61 @@ nothing is lost even when nothing "interesting" happened.
 sqlite3 data/journal.db
 sqlite> select ticker, score, decision, rule_triggered from candidates order by created_at desc limit 20;
 sqlite> select * from risk_events order by at desc limit 10;
-sqlite> select * from circuit_breaker_events order by at desc limit 10;
+```
+
+The persistent breaker has its own SQLite database (default:
+`data/circuit_breaker.db`). Inspect it through the CLI:
+
+```bash
+python -m app.cli breaker status
 ```
 
 ## Promotion Checklist (SHADOW → PAPER → LIVE)
 
-This is a manual review checklist, not something the system can pass
-itself through automatically — per spec §34, "performance is not
-permission."
+This is a manual review checklist, not something the system can pass itself
+through automatically: performance is not permission.
 
-**Before moving `mode:` from SHADOW to PAPER:**
-- [ ] All tests pass (`python -m pytest tests/ -q`)
-- [ ] `run --mode shadow` has been exercised across a range of mock/real
-      market conditions and outcomes look sane on manual review of the
-      journal DB
-- [ ] Alpaca paper API keys obtained and set as environment variables
-      (see `docs/SETUP.md` §5a) — never written into any config file
-- [ ] A real market-data adapter is wired in place of `MockProvider` (see
-      `docs/ARCHITECTURE.md` §7 "Known Gaps") — PAPER mode against
-      synthetic data isn't meaningful
+**Before attempting PAPER:**
+- [ ] All tests pass (`python -m pytest tests/ -q`). This proves only behavior
+      exercised by mocks and fixtures; it does not verify Alpaca.
+- [ ] `run --mode shadow` output and the journal have been manually reviewed as
+      synthetic, hypothetical results — not as market evidence.
+- [ ] The PAPER credential variables named in `docs/SETUP.md` are set outside
+      config files.
+- [ ] The operator understands that PAPER constructs `AlpacaPaperBroker` and
+      Alpaca market data, a broker clock, a regime engine, and catalyst
+      research (unless catalyst research is deliberately disabled). Failure to
+      construct a required PAPER dependency exits rather than producing a
+      synthetic substitute.
+- [ ] The first actual PAPER connection, if authorized outside this document,
+      is treated as verification work and reviewed as such. It has not yet
+      happened.
 
-**Before moving `mode:` from PAPER to LIVE** — all of
-`config/default.yaml`'s `promotion_criteria.paper_to_live` thresholds, at
-minimum:
-- [ ] ≥100 paper trades completed
-- [ ] ≥20 distinct trading sessions
-- [ ] Expectancy ≥ 0.05R, profit factor ≥ 1.2, max drawdown ≤ 15%
-- [ ] Zero unresolved execution errors in the journal
-- [ ] Zero risk-control violations (every `risk_events` row with
-      `decision=REJECTED` correctly blocked what it should have)
-- [ ] You have manually reviewed a sample of both approved and rejected
-      trades and agree with the risk engine's reasoning
-- [ ] You have generated a **separate, clearly-named** live Alpaca API key
-      (see `docs/SETUP.md` §5b) and are prepared to start with the
-      smallest possible size
+**LIVE is not promotable in the current milestone.** The configuration and
+per-run acknowledgement checks remain part of mode validation, but they do not
+enable execution. `run --mode live` refuses before any broker is built, and
+`AlpacaLiveBroker.OPERATIONALLY_ENABLED` is `False`. No checklist, strategy
+setting, or single boolean changes that.
 
-Then, and only then: create `config/local.yaml` with `mode: LIVE` and run
-with `--i-understand-this-is-live-trading`. See `docs/SAFETY.md` §2 for
-exactly what this does and does not bypass.
+## Emergency Stop and Breaker Reset
 
-## Emergency Stop
+`run` is a single cycle, not a scheduler loop. If a process must be stopped,
+interrupt it. A restarted order-submitting run reconciles its local records
+against broker state; blocking discrepancies prevent new entries until an
+operator resolves them. It must not assume that an interrupted submission
+filled or did not fill.
 
-There is no running persistent process yet in this milestone (`run` is a
-single scan-to-decision cycle, not a scheduler loop — Phase 12). Once a
-scheduler loop exists (e.g. via `apscheduler`, already a dependency), the
-emergency stop procedure will be: kill the process (`Ctrl+C` or `kill
-<pid>`) — since `ShadowBroker`/`AlpacaBroker` never hold state that isn't
-also durably in the journal DB, killing the process cannot "strand" an
-order in an unknown state; `OrderStateMachine` always re-syncs from the
-broker's own confirmed order state on the next read, never assumes a fill
-locally. See `docs/DISASTER_RECOVERY.md`.
+A tripped breaker survives restart in its separate SQLite state store. New
+entries remain blocked while protective exits, position closes, and order
+cancellation remain permitted. Resetting it requires an explicit, audited
+operator command:
+
+```bash
+python -m app.cli breaker reset --operator NAME --reason "..."
+```
+
+The command may request an interactive confirmation. A same-session reset also
+requires the deliberate `--same-session` option. The reset authorization is
+minted by module-level `issue_operator_reset()`; holding a
+`PersistentCircuitBreaker` instance does not provide reset authority, and
+strategy code cannot reset it.
