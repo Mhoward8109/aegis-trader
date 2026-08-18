@@ -1,0 +1,135 @@
+# Aegis Trader — default configuration
+# Every trading-relevant parameter lives here, not in source code (spec §32).
+# Copy to config/local.yaml and edit there; local.yaml is git-ignored and
+# always overrides default.yaml key-by-key.
+
+mode: SHADOW          # RESEARCH | SHADOW | PAPER | LIVE  (spec §2)
+                        # MUST be RESEARCH or SHADOW on first run. Promotion to
+                        # PAPER or LIVE requires editing this file by hand AND
+                        # passing --confirm-mode-change on the CLI (see SAFETY.md).
+
+account:
+  starting_equity_usd: 25000.0     # used for shadow/paper sizing math only;
+                                     # PAPER/LIVE always read live equity from broker
+  currency: USD
+
+risk:
+  max_risk_per_trade_pct: 0.5        # % of equity risked per trade (entry->stop)
+  max_risk_per_trade_usd: null       # optional hard dollar cap; null = unset
+  max_daily_loss_pct: 2.0            # circuit breaker trigger
+  max_daily_loss_usd: null
+  max_weekly_loss_pct: 5.0
+  max_trades_per_day: 10
+  max_concurrent_positions: 3
+  max_position_pct_of_account: 20.0
+  max_sector_exposure_pct: 40.0
+  max_spread_pct: 0.5                # reject candidates with spread wider than this
+  min_liquidity_avg_dollar_vol: 5000000   # 20-day avg $ volume floor
+  max_slippage_pct: 0.3
+  max_consecutive_losses: 3          # triggers circuit breaker, not size increase
+
+circuit_breaker:
+  enabled: true                      # cannot be disabled by strategy code
+  daily_loss_trip: true
+  consecutive_loss_trip: true
+  stale_data_trip: true
+  reconciliation_failure_trip: true
+  repeated_rejected_orders_trip: 3   # N rejects in a session trips breaker
+  excessive_slippage_trip_pct: 1.0
+
+data_freshness:
+  quote_max_age_seconds: 5
+  bar_max_age_seconds: 60
+  news_max_age_seconds: 900
+  account_max_age_seconds: 30
+  position_max_age_seconds: 30
+  order_max_age_seconds: 15
+  on_stale: FAIL_CLOSED               # spec §11 — no other option is permitted
+
+scanner:
+  universe: ALL_US_LISTED
+  price_min: 1.0
+  price_max: 500.0
+  pct_change_min: 3.0
+  gap_pct_min: 2.0
+  rvol_min: 2.0
+  dollar_volume_min: 5000000
+  avg_daily_volume_min: 300000
+  max_spread_pct: 0.5
+  min_float: null
+  max_float: null
+  refresh_seconds: 30
+
+market_data:
+  provider: alpaca            # alpaca | polygon | mock  (see docs/ARCHITECTURE.md)
+  feed: iex                   # iex (free) | sip (paid, requires subscription)
+
+broker:
+  active: alpaca              # alpaca | ibkr | none
+  alpaca:
+    base_url_paper: "https://paper-api.alpaca.markets"
+    # base_url_live intentionally omitted from default config — see SAFETY.md.
+    # It must be added explicitly by the operator only when promoting to LIVE.
+  ibkr:
+    gateway_host: "127.0.0.1"
+    gateway_port: 5000
+
+sessions:
+  timezone: America/New_York
+  premarket_start: "04:00"
+  regular_start: "09:30"
+  regular_end: "16:00"
+  postmarket_end: "20:00"
+  allow_extended_hours: false
+
+event_risk:
+  enabled: true
+  blackout_minutes_before: 10
+  blackout_minutes_after: 10
+  high_impact_event_types: [FOMC, CPI, PPI, NFP, GDP, FED_SPEECH]
+
+strategies:
+  enabled:
+    - opening_range_breakout
+    - vwap_reclaim
+  opening_range_breakout:
+    opening_range_minutes: 5
+    min_rvol: 2.0
+    max_spread_pct: 0.3
+  vwap_reclaim:
+    lookback_minutes: 30
+    reclaim_confirmation_bars: 2
+
+scoring:
+  weights:
+    catalyst_quality: 15
+    catalyst_freshness: 10
+    relative_volume: 15
+    liquidity: 10
+    spread_quality: 5
+    technical_alignment: 15
+    market_trend: 10
+    reward_risk: 10
+    data_confidence: 5
+    historical_strategy_performance: 5
+  min_score_to_display: 40
+  min_score_to_trade: 65
+
+alerts:
+  channels: [log]              # log | webhook | email (extend in adapters)
+  dedupe_window_seconds: 120
+
+logging:
+  level: INFO
+  dir: logs
+  append_only_audit_log: true
+
+promotion_criteria:
+  paper_to_live:
+    min_paper_trades: 100
+    min_sessions: 20
+    min_expectancy_r: 0.05
+    max_drawdown_pct: 15
+    min_profit_factor: 1.2
+    zero_unresolved_execution_errors: true
+    zero_risk_control_violations: true

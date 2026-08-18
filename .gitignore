@@ -1,0 +1,15 @@
+# Secrets and environment-specific config — never commit
+.env
+config/local.yaml
+
+# Runtime state
+data/*.db
+logs/*.db
+logs/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

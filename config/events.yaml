@@ -1,0 +1,15 @@
+# High-impact scheduled events (spec §15). Refresh this file regularly —
+# the system deliberately does NOT hard-code a calendar. See
+# docs/OPERATOR_MANUAL.md for how to update it (and which free calendar
+# sources to pull from, e.g. federalreserve.gov, bls.gov).
+#
+# Example rows (fill in real upcoming dates before relying on this gate):
+# - name: "FOMC Rate Decision"
+#   event_type: FOMC
+#   scheduled_at: "2026-09-16T14:00:00-04:00"
+#   high_impact: true
+# - name: "CPI Report"
+#   event_type: CPI
+#   scheduled_at: "2026-09-11T08:30:00-04:00"
+#   high_impact: true
+[]
