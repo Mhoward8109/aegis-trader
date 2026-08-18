@@ -444,8 +444,13 @@ No document describes future architecture in the present tense.
 |---|---|
 | Branch | `master` |
 | Pre-commit HEAD | `707fb8b71ace5ce603957b9de007806a7d40de30` |
-| Final commit | *(recorded at commit time — see `git log -1`)* |
-| Working tree after commit | clean |
+| Milestone 2 commit | `e79cc04f14c1bd0b36907b3da615bfd078e491f9` — "milestone2: harden paper execution and close audit" |
+| Files in that commit | 26 (8 source, 9 test, 9 doc) |
+| Working tree after commit | clean (`git status --short` empty) |
+| Pushed to | `origin/master` — https://github.com/Mhoward8109/aegis-trader |
+
+A commit cannot contain its own hash, so the row above was added by a small
+follow-up commit that changes this document only.
 
 Secret hygiene confirmed before commit: no `.env`, no `config/local.yaml`, no
 `*.db`, no logs, no API responses. `data/circuit_breaker.db`, `logs/journal.db`,
