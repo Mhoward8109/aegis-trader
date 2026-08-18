@@ -24,7 +24,23 @@ _ALLOWED: dict[OrderState, set[OrderState]] = {
     OrderState.PROPOSED: {OrderState.RISK_APPROVED, OrderState.RISK_REJECTED, OrderState.CANCELLED},
     OrderState.RISK_APPROVED: {OrderState.SUBMITTED, OrderState.CANCELLED},
     OrderState.RISK_REJECTED: set(),  # terminal
-    OrderState.SUBMITTED: {OrderState.ACKNOWLEDGED, OrderState.REJECTED, OrderState.UNKNOWN, OrderState.CANCELLED},
+    # SUBMITTED may go straight to a fill state without ACKNOWLEDGED ever being
+    # observed. This is not a shortcut: ACKNOWLEDGED is a state the BROKER passes
+    # through, not a state this system gets to require. A market order can be
+    # filled between submission and the first status poll, so the first status we
+    # ever see is "filled". The original table omitted these edges, which sent
+    # every fast fill to UNKNOWN -- and UNKNOWN suppresses protective-exit
+    # attachment, so the stricter table produced *less* protected positions, not
+    # more. EXPIRED is included for the same reason.
+    OrderState.SUBMITTED: {
+        OrderState.ACKNOWLEDGED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.FILLED,
+        OrderState.REJECTED,
+        OrderState.EXPIRED,
+        OrderState.UNKNOWN,
+        OrderState.CANCELLED,
+    },
     OrderState.ACKNOWLEDGED: {
         OrderState.PARTIALLY_FILLED,
         OrderState.FILLED,

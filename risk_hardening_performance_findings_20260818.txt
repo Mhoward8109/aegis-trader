@@ -1,0 +1,106 @@
+Risk hardening and performance data — implementation findings
+Date: 2026-08-18
+
+Pre-change risk-limit review
+-----------------------------
+Already implemented and directly reachable when AccountState contained real
+values:
+- max risk per trade percentage (risk budget calculation)
+- optional max dollar risk per trade (risk budget cap)
+- max position percentage (notional clamp)
+- max concurrent positions
+- max daily loss
+- max weekly loss
+- max trades per day
+- max consecutive losses
+- minimum average dollar volume
+- maximum spread percentage
+- maximum estimated slippage percentage
+- buying-power cap
+- sector exposure check (only checked an existing sector percentage)
+
+Incorrect, incomplete, or unreachable in practice:
+- Daily loss, weekly loss, trades/day, and sector exposure were unreachable
+  on the pipeline path documented in AUDIT_MILESTONE2 because that path passed
+  literal zeroes / an empty mapping instead of account or journal aggregates.
+- Max concentration per symbol did not exist as a separate cap. The old
+  duplicate-position veto was not a notional concentration calculation.
+- Position sizing emitted fractional shares via round(..., 4), which is
+  incompatible with whole-share protective orders.
+- Buying power and position caps were applied silently and did not expose the
+  cap arithmetic in the decision.
+- Sector exposure checked only current exposure, not current exposure plus the
+  candidate's projected notional.
+- Stop validation accepted the wrong side of entry because it used an absolute
+  difference; it did not model long versus short direction.
+- Rejection inputs were not consistently sufficient to independently verify
+  the relevant numeric comparison.
+
+Implemented changes
+-------------------
+- AccountState inputs now accept None as an explicit "not supplied" state.
+  RiskEngine rejects fail-closed for every absent required account field rather
+  than treating it as zero or unlimited. A real zero remains valid because it
+  is distinct from None.
+- CandidateRiskInput now carries direction (long/short).
+- Position size begins with risk_budget / stop_distance and is rounded DOWN to
+  whole shares. The selected size is clamped by risk budget, position value,
+  per-symbol concentration, buying power, and projected sector capacity.
+- A configured max_concentration_per_symbol_pct is used when present. For
+  compatibility with existing configuration, max_position_pct_of_account is
+  the conservative fallback concentration cap until that separate key is
+  configured.
+- Stops reject zero distance, non-positive prices, unsupported direction, and
+  wrong-side / negative signed stop distance. Long stops must be below entry;
+  short stops must be above entry.
+- Every rejection names rule_triggered and contains candidate/account numeric
+  inputs, configured/computed limits, plus the observed value and calculation
+  for the firing rule. Sizing approvals include all cap values and projected
+  sector exposure.
+- New additive trade_performance table stores PAPER performance facts:
+  strategy/version, intended entry/stop/targets, fill and slippage, exit/P&L/R,
+  MFE/MAE, catalyst/regime/time-of-day/duration/reasons, and decision/fill/exit/
+  performance timestamps. Existing order columns and callers remain intact.
+- New pure analytics functions calculate absolute and percentage slippage, R
+  multiple, MFE/MAE, and holding duration only from supplied recorded values.
+- TradeJournal.record_paper_trade_performance writes one deterministic,
+  complete performance record per PAPER order.
+
+Tests
+-----
+Focused command:
+  export PATH="$PATH:/home/user/.local/bin"; pytest -q tests/test_risk_engine.py tests/test_risk_limits.py
+Result: 33 passed.
+
+Full command:
+  export PATH="$PATH:/home/user/.local/bin"; pytest -q
+Result: 111 passed, 3 failed.
+The three failures are exclusively tests/test_shadow_broker.py and are caused
+by that separately owned adapter now requiring a grant argument to
+ShadowBroker.submit_order(). These were explicitly listed as ignorable by the
+task and do not involve the owned risk/performance files.
+
+Focused test names:
+- test_max_risk_per_trade_pct_sets_risk_budget_before_sizing
+- test_max_dollar_risk_per_trade_caps_risk_budget
+- test_max_position_size_pct_clamps_whole_share_size
+- test_max_concentration_per_symbol_clamps_whole_share_size
+- test_max_concurrent_positions_blocks_new_trade
+- test_max_daily_loss_blocks_new_trade
+- test_max_weekly_loss_blocks_new_trade
+- test_max_trades_per_day_blocks_new_trade
+- test_max_consecutive_losses_blocks_new_trade_without_resizing
+- test_min_liquidity_blocks_new_trade
+- test_max_spread_blocks_new_trade
+- test_max_estimated_slippage_blocks_new_trade
+- test_buying_power_limit_clamps_whole_share_size
+- test_per_sector_exposure_limit_clamps_projected_exposure
+- test_missing_trades_today_fails_closed
+- test_zero_stop_distance_rejected
+- test_stop_on_wrong_side_for_direction_rejected_with_negative_distance
+- test_sizing_is_invariant_to_consecutive_losses_and_has_no_martingale_path
+- test_r_multiple_is_deterministic
+- test_slippage_is_deterministic_from_recorded_prices
+- test_mfe_mae_are_deterministic_from_recorded_extremes
+- test_holding_duration_is_deterministic_from_recorded_timestamps
+- test_paper_trade_performance_records_complete_deterministic_facts

@@ -176,4 +176,64 @@ def compute_all(df: pd.DataFrame, cfg: dict | None = None) -> dict:
     result["atr14"] = last_or_none(atr(df, 14))
     result["high_of_day"] = high_low_of_day(df)["high"]
     result["low_of_day"] = high_low_of_day(df)["low"]
+
+    # ------------------------------------------------------------------
+    # Structural / stateful signals the shipped strategies gate on.
+    #
+    # These were MISSING from compute_all in Milestone 1, and their absence was
+    # silent rather than loud: ctx.indicators.get("opening_range") returned
+    # None, setup_conditions_met returned False, and the strategy reported
+    # "no setup" -- indistinguishable from "conditions genuinely not met". The
+    # practical effect was that OpeningRangeBreakout and VwapReclaim were BOTH
+    # structurally incapable of ever producing a Setup through the pipeline,
+    # while the end-to-end test still passed because its only order-count
+    # assertion sat behind an `if orders_submitted > 0` guard.
+    #
+    # Computed here in deterministic code so a strategy never has to invent a
+    # value it was not given.
+    # ------------------------------------------------------------------
+    cfg = cfg or {}
+    bar_minutes = int(cfg.get("bar_minutes", 1))
+    result["opening_range"] = opening_range(
+        df, int(cfg.get("opening_range_minutes", 15)), bar_minutes=bar_minutes)
+
+    vwap_series = vwap(df)
+    result["bars_above_vwap"] = _trailing_bars_above(close, vwap_series)
+    result["lost_vwap_recently"] = _lost_vwap_recently(
+        close, vwap_series,
+        lookback_bars=int(cfg.get("vwap_reclaim_lookback_bars", 30)),
+    )
     return result
+
+
+def _trailing_bars_above(close: pd.Series, vwap_series: pd.Series) -> int:
+    """How many consecutive most-recent bars closed above VWAP.
+
+    Returns 0 rather than None when price is not above VWAP: "zero confirming
+    bars" is a true statement, whereas None would make a `>=` comparison inside
+    a strategy raise and be swallowed as a generic error.
+    """
+    above = (close > vwap_series).fillna(False).tolist()
+    count = 0
+    for flag in reversed(above):
+        if not flag:
+            break
+        count += 1
+    return count
+
+
+def _lost_vwap_recently(close: pd.Series, vwap_series: pd.Series,
+                        *, lookback_bars: int) -> bool:
+    """True when price closed BELOW VWAP within the lookback and is now above it.
+
+    This is the actual "reclaim" precondition. Without the earlier loss, price
+    being above VWAP is just an uptrend, not a reclaim; treating the two as the
+    same would let the strategy fire on a setup it was never designed for.
+    """
+    if len(close) < 2:
+        return False
+    above = (close > vwap_series).fillna(False).tolist()
+    if not above[-1]:
+        return False
+    window = above[-lookback_bars:] if lookback_bars > 0 else above
+    return any(not flag for flag in window[:-1])

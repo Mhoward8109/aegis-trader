@@ -27,6 +27,12 @@ risk:
   min_liquidity_avg_dollar_vol: 5000000   # 20-day avg $ volume floor
   max_slippage_pct: 0.3
   max_consecutive_losses: 3          # triggers circuit breaker, not size increase
+  # Stop-distance plausibility band. These are data-integrity gates, not
+  # strategy preferences: a stop far outside this band almost always means entry
+  # and stop were derived from inconsistent price data. Without the upper bound,
+  # sizing silently shrinks to 1-3 shares and submits anyway.
+  max_stop_distance_pct: 15.0        # reject stops further than this from entry
+  min_stop_distance_pct: 0.05        # reject stops so tight that sizing explodes
 
 circuit_breaker:
   enabled: true                      # cannot be disabled by strategy code

@@ -43,6 +43,10 @@ class Catalyst:
     is_fresh: bool
     expected_significance: str  # low | medium | high
     category: str               # earnings|filing|fda|ma|partnership|analyst|legal|management|offering|... 
+    # Additive provenance fields. Defaults preserve existing provider callers.
+    ticker: str = ""
+    headline: str = ""
+    retrieved_at: dt.datetime | None = None
 
 
 class NewsProvider(abc.ABC):

@@ -3,18 +3,34 @@ Broker abstraction (spec §3). Strategy/execution code depends ONLY on this
 interface, never on a concrete broker SDK, so swapping Alpaca <-> IBKR <->
 a future broker never touches strategy code.
 
-Every adapter MUST declare which Mode(s) it is allowed to run under. This is
-enforced structurally: ShadowBroker literally cannot submit a network order
-(the method has no network call in it at all — see shadow_adapter.py),
-and AlpacaBroker's constructor refuses to build a live trading client
-unless allow_live=True is passed AND the caller already passed
-ModeGovernor.assert_execution_allowed(Mode.LIVE) (see cli.py wiring).
+MILESTONE 2 CHANGE (PART 2). Every adapter now declares a concrete
+`environment: BrokerEnvironment` as a CLASS attribute, and `submit_order()`
+requires an `ExecutionGrant` that the adapter independently re-verifies against
+its own declared environment before touching a wire.
+
+Milestone 1's claim that "AlpacaBroker's constructor refuses to build a live
+trading client unless the caller already passed ModeGovernor" was false:
+`allow_live` was an ordinary default-False boolean any caller could flip, and
+nothing in the adapter could observe whether authorization had run. See
+docs/AUDIT_MILESTONE2.md §3.3. The grant argument replaces that honour system:
+an adapter cannot be talked into submitting without evidence, because it needs
+an object it cannot construct.
+
+The re-verification inside the adapter is deliberately redundant with the check
+in ExecutionEngine. Defence in depth means a caller who bypasses the execution
+engine and holds an adapter directly still cannot submit.
 """
 from __future__ import annotations
 
 import abc
 import dataclasses
 from datetime import datetime
+
+from app.execution.authorization import (
+    BrokerEnvironment,
+    ExecutionGrant,
+    ExecutionIntent,
+)
 
 
 @dataclasses.dataclass
@@ -92,7 +108,24 @@ class BrokerAdapter(abc.ABC):
     """Normalized operations every adapter must implement (spec §3)."""
 
     name: str = "base"
-    supports_live: bool = False   # only real network-order adapters set True
+
+    #: What this adapter is ACTUALLY wired to. Subclasses must override with a
+    #: real value; the base sentinel of None makes "forgot to declare it" a
+    #: hard failure at authorization time rather than a silent default.
+    environment: BrokerEnvironment | None = None
+
+    def assert_grant_authorizes(self, grant: ExecutionGrant, intent: ExecutionIntent) -> None:
+        """Every concrete submit_order() MUST call this first. Verifies the
+        grant was issued for this exact order AND for this adapter's declared
+        environment, then consumes it so it cannot authorize a second order."""
+        if self.environment is None:
+            raise BrokerError(
+                f"{type(self).__name__} does not declare a BrokerEnvironment. "
+                f"Refusing to submit: an adapter whose environment is unknown "
+                f"cannot be proven to match the operating mode."
+            )
+        grant.assert_valid_for(intent, self.environment)
+        grant.consume()
 
     @abc.abstractmethod
     def get_account(self) -> AccountSnapshot: ...
@@ -110,7 +143,65 @@ class BrokerAdapter(abc.ABC):
     def get_quote(self, ticker: str) -> Quote: ...
 
     @abc.abstractmethod
-    def submit_order(self, req: OrderRequest) -> BrokerOrderStatus: ...
+    def submit_order(self, req: OrderRequest, grant: ExecutionGrant) -> BrokerOrderStatus:
+        """Submit an order. `grant` is not optional and has no default: a
+        caller who has not been through ExecutionAuthorizer cannot even form a
+        valid call to this method."""
+        ...
+
+    def submit_protective_order(self, req: OrderRequest) -> BrokerOrderStatus:
+        """Submit a RISK-REDUCING order with NO ExecutionGrant.
+
+        Deliberately ungated, and deliberately separate from `submit_order()`.
+        The asymmetry is a safety property: attaching a stop, target, or OCO to a
+        position that already exists must never be blocked by the entry
+        authorization path. A tripped circuit breaker, a stale quote, or an
+        expired grant must not be able to leave an open position unprotected.
+
+        Because it is ungated, implementations MUST refuse anything that could
+        open or increase exposure. `_assert_risk_reducing()` below enforces that,
+        and every implementation must call it first.
+        """
+        raise BrokerError(
+            f"{type(self).__name__} does not implement an ungated protective-order "
+            f"path. Broker-side protection cannot be attached through this adapter, "
+            f"so positions opened with it cannot be reported as protected."
+        )
+
+    @staticmethod
+    def _assert_risk_reducing(req: OrderRequest) -> None:
+        """Guard for the ungated protective path.
+
+        Without this, `submit_protective_order()` would be an unauthenticated way
+        to open a position -- a hole straight through the authorization boundary.
+        Only exit-side order types that require a trigger price are permitted.
+        """
+        side = (req.side or "").upper()
+        if side not in ("SELL", "COVER"):
+            raise BrokerError(
+                f"submit_protective_order() refuses side {side!r}. This path is "
+                f"ungated precisely because it can only REDUCE exposure; BUY and "
+                f"SHORT must go through submit_order() with an ExecutionGrant."
+            )
+        if req.order_type not in ("stop", "stop_limit", "limit", "oco", "trailing_stop"):
+            raise BrokerError(
+                f"submit_protective_order() refuses order_type "
+                f"{req.order_type!r}; only protective exit types are permitted "
+                f"on the ungated path."
+            )
+        if req.order_type == "oco" and (req.stop_price is None
+                                        or req.take_profit_price is None):
+            raise BrokerError(
+                "An OCO requires BOTH a stop_price and a take_profit_price; a "
+                "one-legged OCO is rejected by the broker and would leave the "
+                "position believing it is protected."
+            )
+        if req.order_type in ("stop", "stop_limit") and req.stop_price is None:
+            raise BrokerError(
+                f"A {req.order_type} protective order requires a stop_price.")
+        if req.order_type == "trailing_stop" and req.trail_percent is None:
+            raise BrokerError(
+                "A trailing_stop protective order requires trail_percent.")
 
     @abc.abstractmethod
     def modify_order(self, broker_order_id: str, **changes) -> BrokerOrderStatus: ...

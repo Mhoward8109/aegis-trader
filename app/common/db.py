@@ -131,6 +131,53 @@ class Order(Base):
 
     candidate: Mapped["Candidate"] = relationship(back_populates="orders")
     events: Mapped[list["OrderEvent"]] = relationship(back_populates="order")
+    performance: Mapped["TradePerformance | None"] = relationship(back_populates="order", uselist=False)
+
+
+class TradePerformance(Base):
+    """Immutable performance facts recorded for one PAPER order.
+
+    This is deliberately a new, additive table rather than a destructive
+    redesign of ``orders``.  It preserves every original order row and makes
+    the full inputs behind a measured PAPER outcome available for later
+    analysis, including rejected paper attempts.
+    """
+    __tablename__ = "trade_performance"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"), unique=True, index=True)
+    candidate_id: Mapped[str | None] = mapped_column(ForeignKey("candidates.id"), nullable=True, index=True)
+    mode: Mapped[TradeMode] = mapped_column(Enum(TradeMode), default=TradeMode.PAPER)
+    ticker: Mapped[str] = mapped_column(String, index=True)
+
+    strategy_name: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    strategy_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    intended_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop: Mapped[float | None] = mapped_column(Float, nullable=True)
+    targets_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    actual_fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    slippage_absolute: Mapped[float | None] = mapped_column(Float, nullable=True)
+    slippage_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    r_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    catalyst_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    market_regime_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    time_of_day: Mapped[str | None] = mapped_column(String, nullable=True)
+    holding_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    decision_data_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fill_data_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_data_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    performance_data_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    order: Mapped["Order"] = relationship(back_populates="performance")
 
 
 class OrderEvent(Base):

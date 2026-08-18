@@ -13,8 +13,9 @@ from app.catalyst.engine import CatalystEngine, NullNewsProvider
 from app.common.db import Candidate, init_db
 from app.common.modes import Mode
 from app.journal.store import TradeJournal
-from app.marketdata.regime import build_regime_snapshot
+from app.execution.authorization import ExecutionAuthorizer
 from app.orchestration.pipeline import run_pipeline
+from app.risk.persistent_circuit_breaker import PersistentCircuitBreaker
 from app.risk.engine import RiskEngine
 from app.scanner.base import ScanCriteria
 from app.scanner.mock_provider import MockProvider
@@ -62,14 +63,49 @@ def test_shadow_mode_pipeline_runs_end_to_end_and_journals_everything(tmp_path):
     catalyst_engine = CatalystEngine([NullNewsProvider()])
     strategies = [OpeningRangeBreakout({"min_rvol": 0.5, "max_spread_pct": 5.0}),
                   VwapReclaim({"max_spread_pct": 5.0})]
-    regime = build_regime_snapshot(spy_pct=0.5, qqq_pct=0.4, iwm_pct=0.3, vix_level=14,
-                                     breadth=1.2, spy_range_pct=2.0, as_of="test")
     criteria = ScanCriteria(price_min=1, price_max=500, rvol_min=0.5, dollar_volume_min=100_000)
 
     result = run_pipeline(
         mode=Mode.SHADOW, provider=provider, criteria=criteria, strategies=strategies,
         scorer=scorer, catalyst_engine=catalyst_engine, risk_engine=risk_engine, risk_cfg=RISK_CFG,
-        broker=broker, journal=journal, regime=regime, min_score_to_consider=0.0,
+        broker=broker, journal=journal, min_score_to_consider=0.0,
+        authorizer=ExecutionAuthorizer(target_mode=Mode.SHADOW),
+        circuit_breaker=PersistentCircuitBreaker(tmp_path / "breaker.db"),
+        config_mode=Mode.SHADOW, config_mode_source="default.yaml",
+    )
+
+    # 0. The run was not halted by a system-level gate, and no candidate died of
+    #    an unhandled exception. Asserted FIRST and loudly, because an earlier
+    #    version of this test passed while all 10 candidates were crashing in
+    #    the freshness gate: every later assertion is satisfied by an empty or
+    #    all-errored result set. A test that cannot distinguish "nothing traded
+    #    because the gates said no" from "nothing traded because the code threw"
+    #    is not evidence of anything.
+    assert not result.halted, result.halt_reason
+    errored = [o for o in result.outcomes if o.stage_reached == "error"]
+    assert not errored, (
+        "candidates raised unhandled exceptions: "
+        + "; ".join(f"{o.ticker}: {o.rejection_reason} {o.detail}" for o in errored)
+    )
+
+    # 0b. Every outcome must be one of the stages this pipeline can legitimately
+    #     reach. "error" is excluded above; anything unrecognised means a stage
+    #     label was introduced without this test being told about it.
+    #
+    #     Honest note about what this fixture does and does not prove: with
+    #     MockProvider(seed=7) the random walk trends DOWN, so neither
+    #     OpeningRangeBreakout nor VwapReclaim ever triggers and every candidate
+    #     legitimately ends at "strategy_no_setup". This test therefore proves
+    #     the scan/catalyst/strategy/journal path and the absence of crashes -- it
+    #     does NOT prove the submission path. That is proved separately by
+    #     test_pipeline_submission.py, which uses a fixture engineered to trigger.
+    legitimate_stages = {
+        "scored", "scored_research_only", "strategy_no_setup",
+        "risk_rejected", "not_authorized", "submitted", "submission_unknown",
+    }
+    stages_reached = {o.stage_reached for o in result.outcomes}
+    assert stages_reached <= legitimate_stages, (
+        f"unrecognised stage(s): {stages_reached - legitimate_stages}"
     )
 
     # 1. The scanner actually found candidates.
@@ -111,14 +147,15 @@ def test_research_mode_never_submits_orders_even_with_zero_score_threshold(tmp_p
     catalyst_engine = CatalystEngine([NullNewsProvider()])
     strategies = [OpeningRangeBreakout({"min_rvol": 0.5, "max_spread_pct": 5.0}),
                   VwapReclaim({"max_spread_pct": 5.0})]
-    regime = build_regime_snapshot(spy_pct=0.5, qqq_pct=0.4, iwm_pct=0.3, vix_level=14,
-                                     breadth=1.2, spy_range_pct=2.0, as_of="test")
     criteria = ScanCriteria(price_min=1, price_max=500, rvol_min=0.5, dollar_volume_min=100_000)
 
     result = run_pipeline(
         mode=Mode.RESEARCH, provider=provider, criteria=criteria, strategies=strategies,
         scorer=scorer, catalyst_engine=catalyst_engine, risk_engine=risk_engine, risk_cfg=RISK_CFG,
-        broker=broker, journal=journal, regime=regime, min_score_to_consider=0.0,
+        broker=broker, journal=journal, min_score_to_consider=0.0,
+        authorizer=ExecutionAuthorizer(target_mode=Mode.RESEARCH),
+        circuit_breaker=PersistentCircuitBreaker(tmp_path / "breaker.db"),
+        config_mode=Mode.RESEARCH, config_mode_source="default.yaml",
     )
     assert result.orders_submitted == 0
     assert len(broker.get_trade_history()) == 0
